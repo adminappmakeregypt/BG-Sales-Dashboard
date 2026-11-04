@@ -204,7 +204,8 @@ body.exporting .toast { opacity: 0 !important; }
 .btn:disabled { opacity: .55; cursor: progress; }
 body.exporting .chart-box, body.exporting .chart-box.tall { height: 270px; }
 body.exporting .chart-box.short { height: 200px; }
-body.exporting .tbl-wrap { max-height: 360px; overflow: hidden; }
+body.exporting .tbl-wrap { max-height: none; overflow: visible; }
+body.exporting thead th, body.exporting tfoot td { position: static; }
 body.exporting .notice { display: none; }
 body.exporting .card { box-shadow: none; }
 
@@ -275,6 +276,7 @@ body.exporting .card { box-shadow: none; }
   const ACH_GOOD = 1.0;   // >= 100% of target
   const ACH_WARN = 0.85;  // 85-99% of target
   const UTIL_HIGH = 0.9;  // capacity constrained
+  const EXPORT_ROWS = 10; // table rows per table in the PowerPoint export
 
   // Sheet -> required columns. Extra columns are ignored.
   const SCHEMA = {
@@ -517,9 +519,14 @@ body.exporting .card { box-shadow: none; }
       if (st.q) { const q = st.q.toLowerCase(); list = list.filter(r => cols.some(c => String(val(c, r) ?? '').toLowerCase().includes(q))); }
       if (st.sort) { const c = cols.find(x => x.k === st.sort); list = list.slice().sort((a, b) => { const x = val(c, a), y = val(c, b); if (x == null) return 1; if (y == null) return -1; return (typeof x === 'number' && typeof y === 'number' ? x - y : String(x).localeCompare(String(y))) * st.dir; }); }
       $('thead', container).innerHTML = '<tr>' + cols.map(c => `<th class="${c.cls || ''}" data-k="${c.k}">${c.label}<span class="arrow">${st.sort === c.k ? (st.dir > 0 ? '▲' : '▼') : '↕'}</span></th>`).join('') + '</tr>';
-      $('tbody', container).innerHTML = list.map(r => '<tr>' + cols.map(c => `<td class="${c.cls || ''}">${c.f ? c.f(r) : esc(val(c, r))}</td>`).join('') + '</tr>').join('') || `<tr><td colspan="${cols.length}" class="l">No rows for the current filters.</td></tr>`;
+      const exporting = document.body.classList.contains('exporting');
+      const shown = exporting ? list.slice(0, EXPORT_ROWS) : list;
+      const more = list.length - shown.length;
+      $('tbody', container).innerHTML = shown.map(r => '<tr>' + cols.map(c => `<td class="${c.cls || ''}">${c.f ? c.f(r) : esc(val(c, r))}</td>`).join('') + '</tr>').join('') || `<tr><td colspan="${cols.length}" class="l">No rows for the current filters.</td></tr>`;
       $('tfoot', container).innerHTML = opt.total ? '<tr>' + cols.map(c => `<td class="${c.cls || ''}">${opt.total[c.k] ?? ''}</td>`).join('') + '</tr>' : '';
       $('.count', container).textContent = `${list.length} row(s)`;
+      const old = $('.export-more', container); if (old) old.remove();
+      if (more > 0) container.insertAdjacentHTML('beforeend', `<p class="note export-more">Top ${shown.length} of ${list.length} rows shown. The full table is in the dashboard.</p>`);
       $$('thead th', container).forEach(th => th.onclick = () => { const k = th.dataset.k; st.dir = st.sort === k ? -st.dir : -1; st.sort = k; draw(); });
       st.list = list;
     };
