@@ -1,0 +1,631 @@
+/* Alborg Scan Business Review dashboard
+ * Reads the consolidated workbook (BG_Scan_Dashboard_Data.xlsx) in the browser.
+ * No server needed: works on GitHub Pages or opened locally.
+ */
+(function () {
+  'use strict';
+
+  /* ---------- Configuration ---------- */
+  const DEFAULT_FILE = 'data/BG_Scan_Dashboard_Data.xlsx';
+  const ACH_GOOD = 1.0;   // >= 100% of target
+  const ACH_WARN = 0.85;  // 85-99% of target
+  const UTIL_HIGH = 0.9;  // capacity constrained
+
+  // Sheet -> required columns. Extra columns are ignored.
+  const SCHEMA = {
+    Branch_KPI: ['Period', 'Branch', 'Segment', 'Metric', 'Target', 'Actual', 'LastYear'],
+    Modality_KPI: ['Period', 'Segment', 'Modality', 'Metric', 'Target', 'Actual', 'LastYear', 'LastMonth'],
+    Branch_Modality: ['Period', 'Branch', 'Segment', 'Modality', 'VisitTarget', 'Visits', 'StudyTarget', 'Studies', 'RevenueTarget', 'Revenue'],
+    Branch_History: ['Period', 'Branch', 'Segment', 'Modality', 'Visits'],
+    Utilization: ['Period', 'Branch', 'Modality', 'W1_Util', 'W2_Util', 'W3_Util', 'W4_Util', 'Actual', 'Capacity'],
+    Rep_KPI: ['Period', 'Rep', 'VisitMTDTarget', 'Visits', 'RevenueMTDTarget', 'Revenue', 'Revenue_LY', 'Revenue_LM'],
+    Specialty_Branch: ['Period', 'Branch', 'Specialty_EN', 'Doctors', 'Visits', 'Revenue'],
+    Doctor_YoY: ['Period', 'List', 'DoctorID', 'Doctor', 'Rep', 'Specialty_EN', 'Visits_LY', 'Visits'],
+    Doctor_Summary: ['Period', 'Group', 'DoctorCount', 'VisitChange'],
+    Doctor_Feedback: ['Period', 'DoctorID', 'Doctor', 'Rep', 'Specialty_EN', 'Visits_LY', 'Visits', 'Comment_AR', 'Suggested_Reason'],
+    Corp_Category: ['Period', 'Category_EN', 'Visits_LY', 'Visits', 'Studies_LY', 'Studies', 'Revenue_LY', 'Revenue', 'RevenueTarget'],
+    Corp_Customers: ['Period', 'Customer', 'Category_EN', 'Studies_LY', 'Studies', 'Visits_LY', 'Visits', 'Revenue_LY', 'Revenue', 'RevenueTarget']
+  };
+
+  const PAGES = [
+    { id: 'overview', title: 'Network overview', render: renderOverview },
+    { id: 'modality', title: 'Modality performance', render: renderModality },
+    { id: 'utilization', title: 'Machine utilization', render: renderUtilization },
+    { id: 'branch', title: 'Branch deep-dive', render: renderBranch },
+    { id: 'doctors', title: 'Doctors & medical reps', render: renderDoctors },
+    { id: 'corporate', title: 'Corporate analysis', render: renderCorporate }
+  ];
+
+  /* ---------- State ---------- */
+  const S = {
+    data: null, fileName: '', periods: [],
+    from: '', to: '', branch: 'All', segment: 'All',
+    page: 'overview',
+    p: { // page-level filters
+      ovMetric: 'Revenue', modMetric: 'Revenue', utilModality: 'MRI', brBranch: '', brMetric: 'Revenue',
+      rep: 'All', specialty: 'All', reason: 'All', moverList: 'Top decliners',
+      corpMetric: 'Revenue', corpWalkin: false, corpCategory: 'All'
+    }
+  };
+  const charts = {};
+
+  /* ---------- Utilities ---------- */
+  const $ = (s, el = document) => el.querySelector(s);
+  const $$ = (s, el = document) => Array.from(el.querySelectorAll(s));
+  const esc = (v) => String(v == null ? '' : v).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const n = (v) => { if (v == null || v === '') return 0; if (typeof v === 'number') return isFinite(v) ? v : 0; const x = parseFloat(String(v).replace(/[,\s]/g, '').replace(/^\((.*)\)$/, '-$1')); return isFinite(x) ? x : 0; };
+  const div = (a, b) => (b ? a / b : null);
+  const sum = (rows, f) => rows.reduce((t, r) => t + (typeof f === 'function' ? f(r) : n(r[f])), 0);
+  const uniq = (arr) => Array.from(new Set(arr.filter(v => v != null && v !== '')));
+  function groupBy(rows, keyFn) { const m = new Map(); rows.forEach(r => { const k = keyFn(r); if (!m.has(k)) m.set(k, []); m.get(k).push(r); }); return m; }
+
+  const NF0 = new Intl.NumberFormat('en-US', { maximumFractionDigits: 0 });
+  const fmt = (v) => (v == null ? '–' : NF0.format(Math.round(v)));
+  function fmtShort(v) {
+    if (v == null) return '–'; const a = Math.abs(v);
+    if (a >= 1e6) return (v / 1e6).toFixed(a >= 1e7 ? 1 : 2) + 'M';
+    if (a >= 1e4) return (v / 1e3).toFixed(0) + 'K';
+    return fmt(v);
+  }
+  const pct = (v, d = 0) => (v == null ? '–' : (v * 100).toFixed(d) + '%');
+  const signed = (v) => (v == null ? '–' : (v > 0 ? '+' : '') + fmt(v));
+  const signedPct = (v) => (v == null ? 'N/A' : (v > 0 ? '+' : '') + (v * 100).toFixed(0) + '%');
+  const growth = (cur, prev) => (prev ? cur / prev - 1 : null); // null = new / no base
+
+  function achPill(a) {
+    if (a == null) return '<span class="pill na">– No target</span>';
+    if (a >= ACH_GOOD) return `<span class="pill good">✓ ${pct(a)}</span>`;
+    if (a >= ACH_WARN) return `<span class="pill warn">▲ ${pct(a)}</span>`;
+    return `<span class="pill bad">▼ ${pct(a)}</span>`;
+  }
+  function deltaHtml(g, label) {
+    if (g == null) return `<span>${label}: N/A</span>`;
+    return `<span class="delta ${g >= 0 ? 'up' : 'down'}">${g >= 0 ? '▲' : '▼'} ${signedPct(g)}</span> <span>${label}</span>`;
+  }
+  function toast(msg) { const t = $('#toast'); t.textContent = msg; t.classList.add('show'); clearTimeout(t._h); t._h = setTimeout(() => t.classList.remove('show'), 2600); }
+  const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+
+  // Period -> "YYYY-MM"
+  function ym(v) {
+    if (v == null || v === '') return '';
+    if (v instanceof Date) { const d = new Date(v.getTime() + 12 * 3600e3); return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0'); }
+    if (typeof v === 'number') { const d = new Date(Math.round((v - 25569) * 86400e3) + 12 * 3600e3); return d.getUTCFullYear() + '-' + String(d.getUTCMonth() + 1).padStart(2, '0'); }
+    const s = String(v).trim(); let m = s.match(/^(\d{4})[-/](\d{1,2})/); if (m) return m[1] + '-' + m[2].padStart(2, '0');
+    m = s.match(/^(\d{1,2})[-/](\d{1,2})[-/](\d{4})/); if (m) return m[3] + '-' + m[2].padStart(2, '0');
+    const d = new Date(s); return isNaN(d) ? '' : d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0');
+  }
+  const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  const ymLabel = (p) => (p ? MONTHS[+p.slice(5) - 1] + ' ' + p.slice(0, 4) : '');
+
+  /* ---------- Filtering ---------- */
+  function rows(sheet, opt = {}) {
+    const all = (S.data && S.data[sheet]) || [];
+    return all.filter(r => {
+      if (opt.period !== false && (r._p < S.from || r._p > S.to)) return false;
+      if (opt.branch !== false && 'Branch' in r && S.branch !== 'All' && r.Branch !== S.branch) return false;
+      if (opt.segment !== false && 'Segment' in r && S.segment !== 'All' && r.Segment !== S.segment) return false;
+      return true;
+    });
+  }
+  const rangeLabel = () => (S.from === S.to ? ymLabel(S.from) : ymLabel(S.from) + ' – ' + ymLabel(S.to));
+  const scopeLabel = () => [rangeLabel(), S.branch === 'All' ? 'All branches' : S.branch, S.segment === 'All' ? 'Walk-in + Corporate' : S.segment].join(' · ');
+
+  /* ---------- Loading ---------- */
+  function parseWorkbook(buf, name) {
+    const wb = XLSX.read(buf, { type: 'array', cellDates: true });
+    const data = {}; const warnings = [];
+    Object.keys(SCHEMA).forEach(sh => {
+      const ws = wb.Sheets[sh];
+      if (!ws) { warnings.push(`Sheet "${sh}" is missing`); data[sh] = []; return; }
+      const list = XLSX.utils.sheet_to_json(ws, { defval: null });
+      const cols = list.length ? Object.keys(list[0]) : [];
+      const miss = SCHEMA[sh].filter(c => !cols.includes(c));
+      if (list.length && miss.length) warnings.push(`"${sh}" is missing column(s): ${miss.join(', ')}`);
+      list.forEach(r => { r._p = ym(r.Period); });
+      data[sh] = list.filter(r => r._p);
+    });
+    const periods = uniq(Object.values(data).flat().map(r => r._p)).sort();
+    if (!periods.length) throw new Error('No rows with a valid Period were found.');
+    S.data = data; S.fileName = name; S.periods = periods;
+    S.from = S.to = periods[periods.length - 1];
+    S.branch = 'All'; S.segment = 'All';
+    setupFilters();
+    $('#dataLabel').textContent = `${name} · ${periods.length} month(s): ${ymLabel(periods[0])} – ${ymLabel(periods[periods.length - 1])}`;
+    S.warnings = warnings;
+    render();
+    toast('Data loaded: ' + name);
+  }
+  function loadFile(file) {
+    const rd = new FileReader();
+    rd.onload = (e) => { try { parseWorkbook(new Uint8Array(e.target.result), file.name); } catch (err) { alert('Could not read the workbook: ' + err.message); } };
+    rd.readAsArrayBuffer(file);
+  }
+  async function tryDefault() {
+    if (location.protocol === 'file:') return;
+    try {
+      const r = await fetch(DEFAULT_FILE, { cache: 'no-store' });
+      if (!r.ok) return;
+      parseWorkbook(new Uint8Array(await r.arrayBuffer()), DEFAULT_FILE.split('/').pop());
+    } catch (e) { /* no default file: wait for upload */ }
+  }
+
+  /* ---------- Global filter UI ---------- */
+  function setupFilters() {
+    const from = $('#fFrom'), to = $('#fTo');
+    const min = S.periods[0], max = S.periods[S.periods.length - 1];
+    [from, to].forEach(i => { i.min = min; i.max = max; });
+    from.value = S.from; to.value = S.to;
+    const branches = uniq([...(S.data.Branch_KPI || []), ...(S.data.Branch_Modality || []), ...(S.data.Utilization || [])].map(r => r.Branch)).sort();
+    $('#fBranch').innerHTML = ['All', ...branches].map(b => `<option>${esc(b)}</option>`).join('');
+    $$('#fSegment button').forEach(b => b.setAttribute('aria-pressed', b.dataset.v === 'All'));
+    S.p.brBranch = branches.includes('Capital') ? 'Capital' : branches[0] || '';
+  }
+  function bindGlobal() {
+    $('#uploadBtn').onclick = () => $('#fileInput').click();
+    $('#fileInput').onchange = (e) => { if (e.target.files[0]) loadFile(e.target.files[0]); e.target.value = ''; };
+    $('#fFrom').onchange = (e) => { S.from = e.target.value || S.periods[0]; if (S.from > S.to) { S.to = S.from; $('#fTo').value = S.to; } render(); };
+    $('#fTo').onchange = (e) => { S.to = e.target.value || S.periods[S.periods.length - 1]; if (S.to < S.from) { S.from = S.to; $('#fFrom').value = S.from; } render(); };
+    $$('#fQuick button').forEach(b => b.onclick = () => {
+      if (!S.data) return; const last = S.periods[S.periods.length - 1];
+      if (b.dataset.q === 'latest') S.from = S.to = last;
+      if (b.dataset.q === 'all') { S.from = S.periods[0]; S.to = last; }
+      if (b.dataset.q === 'ytd') { S.to = last; S.from = last.slice(0, 4) + '-01'; }
+      $('#fFrom').value = S.from; $('#fTo').value = S.to; render();
+    });
+    $('#fBranch').onchange = (e) => { S.branch = e.target.value; if (S.branch !== 'All') S.p.brBranch = S.branch; render(); };
+    $$('#fSegment button').forEach(b => b.onclick = () => { S.segment = b.dataset.v; $$('#fSegment button').forEach(x => x.setAttribute('aria-pressed', x === b)); render(); });
+    $('#resetBtn').onclick = () => { if (!S.data) return; S.from = S.to = S.periods[S.periods.length - 1]; S.branch = 'All'; S.segment = 'All'; setupFilters(); render(); };
+    $('#themeBtn').onclick = () => {
+      const cur = document.documentElement.getAttribute('data-theme') || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+      const next = cur === 'dark' ? 'light' : 'dark'; document.documentElement.setAttribute('data-theme', next);
+      try { localStorage.setItem('bgscan-theme', next); } catch (e) { }
+      render();
+    };
+    $('#printBtn').onclick = () => window.print();
+    $('#presentBtn').onclick = () => {
+      document.body.classList.toggle('present');
+      const on = document.body.classList.contains('present');
+      $('#presentBtn').setAttribute('aria-pressed', on);
+      if (on && document.documentElement.requestFullscreen) document.documentElement.requestFullscreen().catch(() => { });
+      if (!on && document.fullscreenElement) document.exitFullscreen();
+      setTimeout(render, 150);
+    };
+    document.addEventListener('fullscreenchange', () => { if (!document.fullscreenElement && document.body.classList.contains('present')) { document.body.classList.remove('present'); $('#presentBtn').setAttribute('aria-pressed', false); render(); } });
+    document.addEventListener('keydown', (e) => {
+      if (/INPUT|SELECT|TEXTAREA/.test(document.activeElement.tagName)) return;
+      const i = PAGES.findIndex(p => p.id === S.page);
+      if (e.key === 'ArrowRight' && i < PAGES.length - 1) location.hash = PAGES[i + 1].id;
+      if (e.key === 'ArrowLeft' && i > 0) location.hash = PAGES[i - 1].id;
+    });
+    window.addEventListener('hashchange', () => { S.page = (location.hash || '#overview').slice(1); render(); });
+    // drag and drop
+    ['dragenter', 'dragover'].forEach(ev => document.addEventListener(ev, e => { e.preventDefault(); document.body.classList.add('dropping'); }));
+    ['dragleave', 'drop'].forEach(ev => document.addEventListener(ev, e => { e.preventDefault(); if (ev === 'drop' || e.target === document.documentElement) document.body.classList.remove('dropping'); }));
+    document.addEventListener('drop', e => { const f = e.dataTransfer.files[0]; if (f) loadFile(f); });
+    try { const t = localStorage.getItem('bgscan-theme'); if (t) document.documentElement.setAttribute('data-theme', t); } catch (e) { }
+  }
+
+  /* ---------- Render shell ---------- */
+  function renderNav() {
+    $('#nav').innerHTML = PAGES.map((p, i) => `<a href="#${p.id}" class="${p.id === S.page ? 'active' : ''}"><span class="num">${i + 1}</span>${p.title}</a>`).join('');
+  }
+  function render() {
+    if (!PAGES.some(p => p.id === S.page)) S.page = 'overview';
+    renderNav();
+    if (!S.data) return;
+    Object.values(charts).forEach(c => c.destroy()); Object.keys(charts).forEach(k => delete charts[k]);
+    const page = PAGES.find(p => p.id === S.page);
+    const main = $('#page');
+    main.innerHTML = '';
+    if (S.warnings && S.warnings.length) main.insertAdjacentHTML('beforeend', `<div class="notice"><b>Workbook check:</b> ${S.warnings.map(esc).join(' · ')}</div>`);
+    page.render(main);
+    $$('[data-pf]', main).forEach(el => {
+      const key = el.dataset.pf;
+      if (el.tagName === 'SELECT') { el.value = S.p[key]; el.onchange = () => { S.p[key] = el.value; render(); }; }
+      else if (el.type === 'checkbox') { el.checked = !!S.p[key]; el.onchange = () => { S.p[key] = el.checked; render(); }; }
+    });
+    $$('.seg[data-pf]', main).forEach(seg => {
+      const key = seg.dataset.pf;
+      $$('button', seg).forEach(b => { b.setAttribute('aria-pressed', b.dataset.v === String(S.p[key])); b.onclick = () => { S.p[key] = b.dataset.v; render(); }; });
+    });
+  }
+
+  /* ---------- Building blocks ---------- */
+  function head(title, desc, tools = '') {
+    return `<div class="page-head"><div><h2>${title}</h2><p>${desc}</p><p class="note">${esc(scopeLabel())}</p></div><div class="page-tools">${tools}</div></div>`;
+  }
+  const segCtl = (key, label, opts) => `<div class="field"><label>${label}</label><div class="seg" data-pf="${key}">${opts.map(o => `<button type="button" data-v="${esc(o)}">${esc(o)}</button>`).join('')}</div></div>`;
+  const selCtl = (key, label, opts) => `<div class="field"><label>${label}</label><select data-pf="${key}">${opts.map(o => `<option>${esc(o)}</option>`).join('')}</select></div>`;
+  function kpi(label, value, meta = '') { const txt = typeof value === 'string' && /[A-Za-z\u0600-\u06FF]{3,}/.test(value) && !/\d/.test(value); return `<div class="card kpi"><div class="label">${label}</div><div class="value${txt ? ' text' : ''}">${value}</div><div class="meta">${meta}</div></div>`; }
+  function card(id, title, sub, body) { return `<div class="card" id="${id}"><div class="card-head"><div><h3>${title}</h3>${sub ? `<p class="sub">${sub}</p>` : ''}</div></div>${body}</div>`; }
+  const chartBox = (id, cls = '') => `<div class="chart-box ${cls}"><canvas id="${id}" role="img"></canvas></div>`;
+
+  /* Sortable, searchable table with CSV export.
+     cols: [{k, label, f(row)->html, v(row)->sort/export value, cls}] */
+  function table(container, cols, data, opt = {}) {
+    const st = { sort: opt.sort || null, dir: opt.dir || -1, q: '' };
+    const val = (c, r) => (c.v ? c.v(r) : r[c.k]);
+    container.innerHTML = `<div class="tbl-tools">${opt.search !== false ? '<input type="search" placeholder="Search…" aria-label="Search table">' : ''}<button class="btn small" type="button">⇩ CSV</button><span class="count"></span></div><div class="tbl-wrap"><table><thead></thead><tbody></tbody><tfoot></tfoot></table></div>`;
+    const draw = () => {
+      let list = data;
+      if (st.q) { const q = st.q.toLowerCase(); list = list.filter(r => cols.some(c => String(val(c, r) ?? '').toLowerCase().includes(q))); }
+      if (st.sort) { const c = cols.find(x => x.k === st.sort); list = list.slice().sort((a, b) => { const x = val(c, a), y = val(c, b); if (x == null) return 1; if (y == null) return -1; return (typeof x === 'number' && typeof y === 'number' ? x - y : String(x).localeCompare(String(y))) * st.dir; }); }
+      $('thead', container).innerHTML = '<tr>' + cols.map(c => `<th class="${c.cls || ''}" data-k="${c.k}">${c.label}<span class="arrow">${st.sort === c.k ? (st.dir > 0 ? '▲' : '▼') : '↕'}</span></th>`).join('') + '</tr>';
+      $('tbody', container).innerHTML = list.map(r => '<tr>' + cols.map(c => `<td class="${c.cls || ''}">${c.f ? c.f(r) : esc(val(c, r))}</td>`).join('') + '</tr>').join('') || `<tr><td colspan="${cols.length}" class="l">No rows for the current filters.</td></tr>`;
+      $('tfoot', container).innerHTML = opt.total ? '<tr>' + cols.map(c => `<td class="${c.cls || ''}">${opt.total[c.k] ?? ''}</td>`).join('') + '</tr>' : '';
+      $('.count', container).textContent = `${list.length} row(s)`;
+      $$('thead th', container).forEach(th => th.onclick = () => { const k = th.dataset.k; st.dir = st.sort === k ? -st.dir : -1; st.sort = k; draw(); });
+      st.list = list;
+    };
+    const inp = $('input', container); if (inp) inp.oninput = () => { st.q = inp.value; draw(); };
+    $('.btn', container).onclick = () => {
+      const lines = [cols.map(c => c.label).join(',')].concat(st.list.map(r => cols.map(c => { const v = val(c, r); return '"' + String(v ?? '').replace(/"/g, '""') + '"'; }).join(',')));
+      const blob = new Blob(['﻿' + lines.join('\n')], { type: 'text/csv;charset=utf-8' });
+      const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = (opt.name || 'table') + '.csv'; a.click(); URL.revokeObjectURL(a.href);
+    };
+    draw();
+  }
+
+  /* Chart.js wrapper */
+  function chart(id, type, labels, datasets, opt = {}) {
+    const el = document.getElementById(id); if (!el) return;
+    const text = css('--text-2'), grid = css('--grid');
+    Chart.defaults.font.family = getComputedStyle(document.body).fontFamily;
+    const horizontal = opt.horizontal;
+    const valueAxis = { grid: { color: grid }, border: { display: false }, ticks: { color: text, callback: opt.pct ? (v) => (v * 100).toFixed(0) + '%' : (v) => fmtShort(v) }, beginAtZero: true, suggestedMax: opt.max };
+    const catAxis = { grid: { display: false }, ticks: { color: text, autoSkip: false, maxRotation: 45 } };
+    charts[id] = new Chart(el, {
+      type,
+      data: { labels, datasets: datasets.map(d => Object.assign({ borderRadius: type === 'bar' ? 4 : 0, borderSkipped: 'start', maxBarThickness: 30, borderWidth: type === 'line' ? 2 : 0, pointRadius: type === 'line' ? 4 : 0, pointHoverRadius: 6, tension: 0 }, d)) },
+      options: {
+        responsive: true, maintainAspectRatio: false, indexAxis: horizontal ? 'y' : 'x',
+        interaction: { mode: 'index', intersect: false },
+        plugins: {
+          legend: { display: datasets.length > 1, position: 'top', align: 'start', labels: { color: text, boxWidth: 12, boxHeight: 12, usePointStyle: true, pointStyle: 'rectRounded' } },
+          tooltip: { callbacks: { label: (c) => `${c.dataset.label}: ${opt.pct || c.dataset.pct ? pct(c.raw, 1) : fmt(c.raw)}` } }
+        },
+        scales: horizontal ? { x: valueAxis, y: catAxis } : { x: catAxis, y: valueAxis }
+      }
+    });
+  }
+  const statusColor = (a) => (a == null ? css('--target') : a >= ACH_GOOD ? css('--good') : a >= ACH_WARN ? css('--warn') : css('--bad'));
+
+  const METRIC_COLS = { Visits: ['VisitTarget', 'Visits'], Studies: ['StudyTarget', 'Studies'], Revenue: ['RevenueTarget', 'Revenue'] };
+  const unit = (m) => (m === 'Revenue' ? ' (EGP)' : '');
+
+  /* ================= 1. NETWORK OVERVIEW ================= */
+  function renderOverview(main) {
+    const m = S.p.ovMetric;
+    const all = rows('Branch_KPI');
+    main.insertAdjacentHTML('beforeend', head('Network overview', 'How each branch performed against target and against the same month last year.', segCtl('ovMetric', 'Metric', ['Visits', 'Studies', 'Revenue'])));
+    const tiles = ['Visits', 'Studies', 'Revenue'].map(mt => {
+      const r = all.filter(x => x.Metric === mt); const a = sum(r, 'Actual'), t = sum(r, 'Target'), ly = sum(r, 'LastYear');
+      return kpi(mt + unit(mt), fmtShort(a), `${achPill(div(a, t))} of ${fmtShort(t)} target · ${deltaHtml(growth(a, ly), 'vs LY')}`);
+    });
+    const seg = ['Walk-in', 'Corporate'].map(sg => {
+      const r = rows('Branch_KPI', { segment: false }).filter(x => x.Metric === m && x.Segment === sg); const a = sum(r, 'Actual'), t = sum(r, 'Target');
+      return kpi(`${sg} ${m.toLowerCase()}`, fmtShort(a), `${achPill(div(a, t))} · ${deltaHtml(growth(a, sum(r, 'LastYear')), 'vs LY')}`);
+    });
+    main.insertAdjacentHTML('beforeend', `<div class="grid kpis">${tiles.join('')}${seg.join('')}</div>`);
+    const mr = all.filter(x => x.Metric === m);
+    const byB = Array.from(groupBy(mr, r => r.Branch), ([b, r]) => ({ Branch: b, Target: sum(r, 'Target'), Actual: sum(r, 'Actual'), LastYear: sum(r, 'LastYear') }))
+      .map(x => Object.assign(x, { Ach: div(x.Actual, x.Target), YoY: growth(x.Actual, x.LastYear), Gap: x.Actual - x.Target }));
+    const tot = { Target: sum(byB, 'Target'), Actual: sum(byB, 'Actual'), LastYear: sum(byB, 'LastYear') };
+    byB.forEach(x => x.Share = div(x.Actual, tot.Actual));
+    byB.sort((a, b) => b.Actual - a.Actual);
+    main.insertAdjacentHTML('beforeend', `<div class="grid cols-2">
+      ${card('c1', `${m}: actual vs target vs last year`, 'By branch' + unit(m), chartBox('ch1'))}
+      ${card('c2', 'Target achievement by branch', 'Bar colour shows status: green ≥100%, amber 85–99%, red <85%', chartBox('ch2'))}
+    </div><div class="grid" style="margin-top:14px">${card('c3', `Branch table: ${m}`, 'Gap = actual − target. Growth from a zero base shows N/A.', '<div id="t1"></div>')}</div>`);
+    chart('ch1', 'bar', byB.map(x => x.Branch), [
+      { label: 'Target', data: byB.map(x => x.Target), backgroundColor: css('--target') },
+      { label: 'Actual', data: byB.map(x => x.Actual), backgroundColor: css('--s1') },
+      { label: 'Last year', data: byB.map(x => x.LastYear), backgroundColor: css('--s2') }]);
+    const sorted = byB.filter(x => x.Ach != null).sort((a, b) => b.Ach - a.Ach);
+    chart('ch2', 'bar', sorted.map(x => x.Branch), [{ label: 'Achievement', data: sorted.map(x => x.Ach), backgroundColor: sorted.map(x => statusColor(x.Ach)) }], { horizontal: true, pct: true });
+    table($('#t1'), [
+      { k: 'Branch', label: 'Branch', cls: 'l' },
+      { k: 'Target', label: 'Target', f: r => fmt(r.Target) }, { k: 'Actual', label: 'Actual', f: r => fmt(r.Actual) },
+      { k: 'Ach', label: 'Ach %', f: r => achPill(r.Ach) },
+      { k: 'Gap', label: 'Gap to target', f: r => `<span class="${r.Gap < 0 ? 'delta down' : 'delta up'}">${signed(r.Gap)}</span>` },
+      { k: 'LastYear', label: 'Last year', f: r => fmt(r.LastYear) },
+      { k: 'YoY', label: 'YoY', f: r => signedPct(r.YoY) },
+      { k: 'Share', label: 'Share', f: r => pct(r.Share) }
+    ], byB, { sort: 'Actual', name: 'branch_' + m, total: { Branch: 'Total', Target: fmt(tot.Target), Actual: fmt(tot.Actual), Ach: achPill(div(tot.Actual, tot.Target)), Gap: signed(tot.Actual - tot.Target), LastYear: fmt(tot.LastYear), YoY: signedPct(growth(tot.Actual, tot.LastYear)), Share: '100%' } });
+  }
+
+  /* ================= 2. MODALITY PERFORMANCE ================= */
+  function renderModality(main) {
+    const m = S.p.modMetric;
+    const byBranch = S.branch !== 'All';
+    main.insertAdjacentHTML('beforeend', head('Modality performance', 'Results per exam type: target achievement, growth vs last year and change vs last month.', segCtl('modMetric', 'Metric', ['Visits', 'Studies', 'Revenue'])));
+    let list;
+    if (!byBranch) {
+      const r = rows('Modality_KPI').filter(x => x.Metric === m);
+      list = Array.from(groupBy(r, x => x.Modality), ([k, v]) => ({ Modality: k, Target: sum(v, 'Target'), Actual: sum(v, 'Actual'), LastYear: sum(v, 'LastYear'), LastMonth: sum(v, 'LastMonth') }));
+    } else {
+      const [tc, ac] = METRIC_COLS[m]; const r = rows('Branch_Modality');
+      list = Array.from(groupBy(r, x => x.Modality), ([k, v]) => ({ Modality: k, Target: sum(v, tc), Actual: sum(v, ac), LastYear: null, LastMonth: null }));
+      main.insertAdjacentHTML('beforeend', `<div class="notice">Branch selected: modality results come from the branch tables, which hold target and actual only. Year-on-year and month-on-month comparisons are shown for all branches.</div>`);
+    }
+    list = list.filter(x => x.Target || x.Actual || x.LastYear || x.LastMonth);
+    list.forEach(x => Object.assign(x, { Ach: div(x.Actual, x.Target), Gap: x.Actual - x.Target, YoY: x.LastYear == null ? null : growth(x.Actual, x.LastYear), MoM: x.LastMonth == null ? null : growth(x.Actual, x.LastMonth), YoYd: x.LastYear == null ? null : x.Actual - x.LastYear, MoMd: x.LastMonth == null ? null : x.Actual - x.LastMonth }));
+    const T = { Target: sum(list, 'Target'), Actual: sum(list, 'Actual'), LastYear: sum(list, r => n(r.LastYear)), LastMonth: sum(list, r => n(r.LastMonth)) };
+    const top = list.filter(x => x.Target > 0).sort((a, b) => a.Gap - b.Gap);
+    const tiles = [
+      kpi(`${m}${unit(m)}`, fmtShort(T.Actual), `${achPill(div(T.Actual, T.Target))} of ${fmtShort(T.Target)}`),
+      kpi('Gap to target', signed(T.Actual - T.Target), 'Sum over all modalities'),
+      byBranch ? '' : kpi('vs last year', signedPct(growth(T.Actual, T.LastYear)), `${signed(T.Actual - T.LastYear)} ${m.toLowerCase()}`),
+      byBranch ? '' : kpi('vs last month', signedPct(growth(T.Actual, T.LastMonth)), `${signed(T.Actual - T.LastMonth)} ${m.toLowerCase()}`),
+      top[0] ? kpi('Largest shortfall', esc(top[0].Modality), `${signed(top[0].Gap)} · ${achPill(top[0].Ach)}`) : ''
+    ];
+    main.insertAdjacentHTML('beforeend', `<div class="grid kpis">${tiles.join('')}</div>
+      <div class="grid cols-2">
+        ${card('c1', 'Gap to target by modality', 'Actual − target. Bars to the left are shortfalls.' + unit(m), chartBox('ch1', 'tall'))}
+        ${card('c2', byBranch ? 'Actual vs target' : 'Actual vs last year vs last month', 'Top modalities by actual' + unit(m), chartBox('ch2', 'tall'))}
+      </div><div class="grid" style="margin-top:14px">${card('c3', `Modality table: ${m}`, 'Large % changes on very small bases are not meaningful; read the absolute change.', '<div id="t1"></div>')}</div>`);
+    const g = list.filter(x => x.Target || x.Actual).sort((a, b) => a.Gap - b.Gap);
+    chart('ch1', 'bar', g.map(x => x.Modality), [{ label: 'Gap to target', data: g.map(x => x.Gap), backgroundColor: g.map(x => x.Gap < 0 ? css('--bad') : css('--good')) }], { horizontal: true });
+    const t8 = list.slice().sort((a, b) => b.Actual - a.Actual).slice(0, 8);
+    chart('ch2', 'bar', t8.map(x => x.Modality), byBranch ? [
+      { label: 'Target', data: t8.map(x => x.Target), backgroundColor: css('--target') },
+      { label: 'Actual', data: t8.map(x => x.Actual), backgroundColor: css('--s1') }] : [
+      { label: 'Actual', data: t8.map(x => x.Actual), backgroundColor: css('--s1') },
+      { label: 'Last year', data: t8.map(x => x.LastYear), backgroundColor: css('--s2') },
+      { label: 'Last month', data: t8.map(x => x.LastMonth), backgroundColor: css('--s3') }]);
+    const cols = [
+      { k: 'Modality', label: 'Modality', cls: 'l' },
+      { k: 'Target', label: 'Target', f: r => fmt(r.Target) }, { k: 'Actual', label: 'Actual', f: r => fmt(r.Actual) },
+      { k: 'Ach', label: 'Ach %', f: r => achPill(r.Ach) }, { k: 'Gap', label: 'Gap', f: r => `<span class="delta ${r.Gap < 0 ? 'down' : 'up'}">${signed(r.Gap)}</span>` }];
+    if (!byBranch) cols.push(
+      { k: 'LastYear', label: 'Last year', f: r => fmt(r.LastYear) }, { k: 'YoYd', label: 'YoY Δ', f: r => signed(r.YoYd) }, { k: 'YoY', label: 'YoY %', f: r => signedPct(r.YoY) },
+      { k: 'LastMonth', label: 'Last month', f: r => fmt(r.LastMonth) }, { k: 'MoMd', label: 'MoM Δ', f: r => signed(r.MoMd) }, { k: 'MoM', label: 'MoM %', f: r => signedPct(r.MoM) });
+    const total = { Modality: 'Total', Target: fmt(T.Target), Actual: fmt(T.Actual), Ach: achPill(div(T.Actual, T.Target)), Gap: signed(T.Actual - T.Target) };
+    if (!byBranch) Object.assign(total, { LastYear: fmt(T.LastYear), YoYd: signed(T.Actual - T.LastYear), YoY: signedPct(growth(T.Actual, T.LastYear)), LastMonth: fmt(T.LastMonth), MoMd: signed(T.Actual - T.LastMonth), MoM: signedPct(growth(T.Actual, T.LastMonth)) });
+    table($('#t1'), cols, list, { sort: 'Actual', name: 'modality_' + m, total });
+  }
+
+  /* ================= 3. UTILIZATION ================= */
+  const HEAT = ['#cde2fb', '#b7d3f6', '#9ec5f4', '#86b6ef', '#6da7ec', '#5598e7', '#3987e5', '#2a78d6', '#256abf', '#1c5cab', '#184f95', '#104281', '#0d366b'];
+  const heatColor = (u) => HEAT[Math.max(0, Math.min(HEAT.length - 1, Math.floor(u * (HEAT.length - 1) + 0.0001)))];
+  function renderUtilization(main) {
+    const r = rows('Utilization', { segment: false });
+    const mods = uniq((S.data.Utilization || []).map(x => x.Modality));
+    if (!mods.includes(S.p.utilModality)) S.p.utilModality = mods[0];
+    main.insertAdjacentHTML('beforeend', head('Machine utilization', 'How much of each machine’s available capacity was used (exams done ÷ capacity). Capacity is not the sales target.', selCtl('utilModality', 'Modality for weekly view', mods)));
+    const byMod = Array.from(groupBy(r, x => x.Modality), ([k, v]) => ({ Modality: k, Actual: sum(v, 'Actual'), Capacity: sum(v, 'Capacity') })).map(x => Object.assign(x, { Util: div(x.Actual, x.Capacity), Spare: x.Capacity - x.Actual }));
+    const A = sum(byMod, 'Actual'), C = sum(byMod, 'Capacity');
+    const cells = r.map(x => Object.assign({}, x, { Util: div(n(x.Actual), n(x.Capacity)) }));
+    const maxed = cells.filter(x => x.Util >= UTIL_HIGH);
+    const best = byMod.slice().sort((a, b) => b.Util - a.Util)[0], low = byMod.filter(x => x.Capacity > 1000).sort((a, b) => a.Util - b.Util)[0];
+    main.insertAdjacentHTML('beforeend', `<div class="grid kpis">
+      ${kpi('Overall utilization', pct(div(A, C)), `${fmt(A)} exams of ${fmt(C)} capacity`)}
+      ${kpi('Spare capacity', fmtShort(C - A), 'exams available but not used')}
+      ${kpi(`Near or above capacity (≥${pct(UTIL_HIGH)})`, maxed.length, maxed.slice(0, 3).map(x => esc(x.Branch + ' ' + x.Modality)).join(', ') || 'None')}
+      ${best ? kpi('Busiest modality', esc(best.Modality), pct(best.Util)) : ''}
+      ${low ? kpi('Most idle (large capacity)', esc(low.Modality), pct(low.Util) + ' used') : ''}
+    </div>`);
+    // heatmap branch x modality
+    const branches = uniq(cells.map(x => x.Branch)); const modsInRange = byMod.slice().sort((a, b) => b.Capacity - a.Capacity).map(x => x.Modality);
+    const agg = {}; cells.forEach(x => { const k = x.Branch + '|' + x.Modality; agg[k] = agg[k] || { a: 0, c: 0 }; agg[k].a += n(x.Actual); agg[k].c += n(x.Capacity); });
+    const ink = (u) => (u > 0.55 ? '#ffffff' : '#0b0b0b');
+    let heat = `<div class="tbl-wrap"><table class="heat"><thead><tr><th>Branch</th>${modsInRange.map(m => `<th>${esc(m)}</th>`).join('')}</tr></thead><tbody>`;
+    branches.forEach(b => {
+      heat += `<tr><td>${esc(b)}</td>` + modsInRange.map(m => { const v = agg[b + '|' + m]; if (!v || !v.c) return '<td class="empty">–</td>'; const u = v.a / v.c; return `<td style="background:${heatColor(u)};color:${ink(u)}" title="${esc(b)} · ${esc(m)}: ${fmt(v.a)} of ${fmt(v.c)}">${pct(u)}${u >= UTIL_HIGH ? ' ●' : ''}</td>`; }).join('') + '</tr>';
+    });
+    heat += `<tr><td><b>Network</b></td>${modsInRange.map(m => { const x = byMod.find(z => z.Modality === m); return `<td><b>${pct(x.Util)}</b></td>`; }).join('')}</tr></tbody></table></div>
+      <div class="legend-scale" style="margin-top:8px">0%<span class="bar"></span>100%+ · ● = at or above ${pct(UTIL_HIGH)} (capacity constrained) · – = modality not available</div>`;
+    main.insertAdjacentHTML('beforeend', card('c0', 'Utilization heatmap', 'MTD utilization by branch and modality', heat));
+    const sel = cells.filter(x => x.Modality === S.p.utilModality);
+    const wk = ['W1_Util', 'W2_Util', 'W3_Util', 'W4_Util'];
+    main.insertAdjacentHTML('beforeend', `<div class="grid cols-2" style="margin-top:14px">
+      ${card('c1', `${esc(S.p.utilModality)}: MTD utilization by branch`, 'Sorted high to low', chartBox('ch1'))}
+      ${card('c2', `${esc(S.p.utilModality)}: weekly utilization`, 'Weekly utilization per branch (average across selected months)', chartBox('ch2'))}
+    </div><div class="grid" style="margin-top:14px">${card('c3', 'Utilization detail', 'All branch × modality rows in the selected period', '<div id="t1"></div>')}</div>`);
+    const bb = Array.from(groupBy(sel, x => x.Branch), ([b, v]) => ({ b, u: div(sum(v, 'Actual'), sum(v, 'Capacity')), w: wk.map(k => sum(v, k) / v.length) })).sort((a, b) => b.u - a.u);
+    chart('ch1', 'bar', bb.map(x => x.b), [{ label: 'MTD utilization', data: bb.map(x => x.u), backgroundColor: bb.map(x => x.u >= UTIL_HIGH ? css('--s2') : css('--s1')) }], { horizontal: true, pct: true, max: 1 });
+    const pal = [css('--s1'), css('--s2'), css('--s3'), '#eda100', '#e87ba4', '#008300', css('--s4'), '#e34948'];
+    chart('ch2', 'line', ['Week 1', 'Week 2', 'Week 3', 'Week 4'], bb.slice(0, 8).map((x, i) => ({ label: x.b, data: x.w, borderColor: pal[i], backgroundColor: pal[i], pct: true })), { pct: true });
+    const agRows = Object.entries(agg).map(([k, v]) => { const [b, m] = k.split('|'); return { Branch: b, Modality: m, Actual: v.a, Capacity: v.c, Util: div(v.a, v.c), Spare: v.c - v.a }; });
+    table($('#t1'), [
+      { k: 'Branch', label: 'Branch', cls: 'l' }, { k: 'Modality', label: 'Modality', cls: 'l' },
+      { k: 'Actual', label: 'Exams done', f: r => fmt(r.Actual) }, { k: 'Capacity', label: 'Capacity', f: r => fmt(r.Capacity) },
+      { k: 'Util', label: 'Utilization', f: r => pct(r.Util) + (r.Util >= UTIL_HIGH ? ' ●' : '') }, { k: 'Spare', label: 'Spare capacity', f: r => fmt(r.Spare) }
+    ], agRows, { sort: 'Util', name: 'utilization' });
+  }
+
+  /* ================= 4. BRANCH DEEP-DIVE ================= */
+  function renderBranch(main) {
+    const branches = uniq((S.data.Branch_Modality || []).map(x => x.Branch)).sort();
+    if (S.branch !== 'All' && branches.includes(S.branch)) S.p.brBranch = S.branch;
+    if (!branches.includes(S.p.brBranch)) S.p.brBranch = branches[0];
+    const b = S.p.brBranch, m = S.p.brMetric;
+    main.insertAdjacentHTML('beforeend', head(`Branch deep-dive: ${esc(b || '')}`, 'Target achievement per modality for one branch, split into walk-in and corporate.', selCtl('brBranch', 'Branch', branches) + segCtl('brMetric', 'Metric', ['Visits', 'Studies', 'Revenue'])));
+    const r = rows('Branch_Modality', { branch: false }).filter(x => x.Branch === b);
+    const tiles = ['Visits', 'Studies', 'Revenue'].map(mt => { const [tc, ac] = METRIC_COLS[mt]; const a = sum(r, ac), t = sum(r, tc); return kpi(mt + unit(mt), fmtShort(a), `${achPill(div(a, t))} · gap ${fmtShort(a - t)}`); });
+    const segT = ['Walk-in', 'Corporate'].map(sg => { const rr = rows('Branch_Modality', { branch: false, segment: false }).filter(x => x.Branch === b && x.Segment === sg); const [tc, ac] = METRIC_COLS[m]; const a = sum(rr, ac), t = sum(rr, tc); return kpi(`${sg} ${m.toLowerCase()}`, fmtShort(a), achPill(div(a, t))); });
+    main.insertAdjacentHTML('beforeend', `<div class="grid kpis">${tiles.join('')}${segT.join('')}</div>`);
+    const list = Array.from(groupBy(r, x => x.Modality), ([k, v]) => {
+      const o = { Modality: k }; ['Visits', 'Studies', 'Revenue'].forEach(mt => { const [tc, ac] = METRIC_COLS[mt]; o[mt + 'T'] = sum(v, tc); o[mt] = sum(v, ac); o[mt + 'Ach'] = div(o[mt], o[mt + 'T']); }); o.Gap = o[m] - o[m + 'T']; o.PerStudy = div(o.Revenue, o.Studies); return o;
+    }).filter(x => x.VisitsT || x.Visits || x.RevenueT || x.Revenue);
+    const hist = rows('Branch_History', { period: false, branch: false }).filter(x => x.Branch === b);
+    const histPeriods = uniq(hist.map(x => x._p)).sort();
+    main.insertAdjacentHTML('beforeend', `<div class="grid cols-2">
+      ${card('c1', `Gap to target by modality: ${m}`, 'Actual − target' + unit(m), chartBox('ch1', 'tall'))}
+      ${hist.length ? card('c2', 'Monthly trend by modality', `Walk-in visits, ${histPeriods.map(ymLabel).join(' → ')} (all available months; not limited by the date filter)`, chartBox('ch2', 'tall')) : card('c2', 'Actual vs target', `${m} by modality` + unit(m), chartBox('ch2', 'tall'))}
+    </div><div class="grid" style="margin-top:14px">${card('c3', 'Modality table', 'Visits, studies and revenue vs target. Revenue booked under “(blank)” has no modality assigned in the source.', '<div id="t1"></div>')}</div>`);
+    const g = list.filter(x => x[m + 'T'] || x[m]).sort((a, c) => a.Gap - c.Gap);
+    chart('ch1', 'bar', g.map(x => x.Modality), [{ label: 'Gap to target', data: g.map(x => x.Gap), backgroundColor: g.map(x => x.Gap < 0 ? css('--bad') : css('--good')) }], { horizontal: true });
+    if (hist.length) {
+      const top = Array.from(groupBy(hist, x => x.Modality), ([k, v]) => ({ k, t: sum(v, 'Visits') })).sort((a, c) => c.t - a.t).slice(0, 6).map(x => x.k);
+      const pal = [css('--s1'), css('--s2'), css('--s3'), '#eda100', '#e87ba4', css('--s4')];
+      chart('ch2', 'line', histPeriods.map(ymLabel), top.map((md, i) => ({ label: md, data: histPeriods.map(p => sum(hist.filter(x => x.Modality === md && x._p === p), 'Visits')), borderColor: pal[i], backgroundColor: pal[i] })));
+    } else {
+      const t8 = list.slice().sort((a, c) => c[m] - a[m]).slice(0, 8);
+      chart('ch2', 'bar', t8.map(x => x.Modality), [{ label: 'Target', data: t8.map(x => x[m + 'T']), backgroundColor: css('--target') }, { label: 'Actual', data: t8.map(x => x[m]), backgroundColor: css('--s1') }]);
+    }
+    const T = {}; ['Visits', 'Studies', 'Revenue'].forEach(mt => { T[mt + 'T'] = sum(list, mt + 'T'); T[mt] = sum(list, mt); });
+    table($('#t1'), [
+      { k: 'Modality', label: 'Modality', cls: 'l' },
+      { k: 'VisitsT', label: 'Visit target', f: x => fmt(x.VisitsT) }, { k: 'Visits', label: 'Visits', f: x => fmt(x.Visits) }, { k: 'VisitsAch', label: 'Visit ach', f: x => achPill(x.VisitsAch) },
+      { k: 'StudiesT', label: 'Study target', f: x => fmt(x.StudiesT) }, { k: 'Studies', label: 'Studies', f: x => fmt(x.Studies) }, { k: 'StudiesAch', label: 'Study ach', f: x => achPill(x.StudiesAch) },
+      { k: 'RevenueT', label: 'Revenue target', f: x => fmt(x.RevenueT) }, { k: 'Revenue', label: 'Revenue', f: x => fmt(x.Revenue) }, { k: 'RevenueAch', label: 'Revenue ach', f: x => achPill(x.RevenueAch) },
+      { k: 'PerStudy', label: 'Rev / study', f: x => fmt(x.PerStudy) }
+    ], list, { sort: 'Revenue', name: 'branch_' + b, total: { Modality: 'Total', VisitsT: fmt(T.VisitsT), Visits: fmt(T.Visits), VisitsAch: achPill(div(T.Visits, T.VisitsT)), StudiesT: fmt(T.StudiesT), Studies: fmt(T.Studies), StudiesAch: achPill(div(T.Studies, T.StudiesT)), RevenueT: fmt(T.RevenueT), Revenue: fmt(T.Revenue), RevenueAch: achPill(div(T.Revenue, T.RevenueT)), PerStudy: fmt(div(T.Revenue, T.Studies)) } });
+  }
+
+  /* ================= 5. DOCTORS & REPS ================= */
+  function renderDoctors(main) {
+    const reps = rows('Rep_KPI', { branch: false, segment: false });
+    const yoy = rows('Doctor_YoY', { branch: false, segment: false });
+    const fb = rows('Doctor_Feedback', { branch: false, segment: false });
+    const specs = rows('Specialty_Branch', { segment: false });
+    const repNames = uniq([...reps, ...yoy, ...fb].map(x => x.Rep)).sort();
+    const specNames = uniq([...yoy, ...fb].map(x => x.Specialty_EN)).sort();
+    const reasons = uniq(fb.map(x => x.Suggested_Reason)).sort();
+    main.insertAdjacentHTML('beforeend', head('Doctors & medical reps', 'Walk-in referrals: rep scorecard, referring specialties, top movers and rep feedback on declining doctors.',
+      selCtl('rep', 'Medical rep', ['All', ...repNames]) + selCtl('specialty', 'Specialty', ['All', ...specNames])));
+    if (S.branch !== 'All') main.insertAdjacentHTML('beforeend', '<div class="notice">Rep, doctor and feedback data are network-wide (no branch column). The branch filter applies to the specialty section only.</div>');
+    const fRep = (x) => S.p.rep === 'All' || x.Rep === S.p.rep;
+    const fSpec = (x) => S.p.specialty === 'All' || x.Specialty_EN === S.p.specialty;
+
+    // Rep scorecard
+    const R = Array.from(groupBy(reps, x => x.Rep), ([k, v]) => ({ Rep: k, VT: sum(v, 'VisitMTDTarget'), V: sum(v, 'Visits'), RT: sum(v, 'RevenueMTDTarget'), Rev: sum(v, 'Revenue'), LY: sum(v, 'Revenue_LY'), LM: sum(v, 'Revenue_LM') }))
+      .map(x => Object.assign(x, { VA: div(x.V, x.VT), RA: div(x.Rev, x.RT), Gap: x.Rev - x.RT, YoY: growth(x.Rev, x.LY), MoM: growth(x.Rev, x.LM) }));
+    const RT = { VT: sum(R, 'VT'), V: sum(R, 'V'), RT: sum(R, 'RT'), Rev: sum(R, 'Rev'), LY: sum(R, 'LY'), LM: sum(R, 'LM') };
+    const sumRows = rows('Doctor_Summary', { branch: false, segment: false });
+    const dec = sumRows.filter(x => /declin/i.test(x.Group)), inc = sumRows.filter(x => /grow|inclin/i.test(x.Group));
+    const sel = S.p.rep === 'All' ? null : R.find(x => x.Rep === S.p.rep);
+    main.insertAdjacentHTML('beforeend', `<div class="grid kpis">
+      ${sel ? kpi(`${esc(sel.Rep)}: revenue (EGP)`, fmtShort(sel.Rev), `${achPill(sel.RA)} · ${deltaHtml(sel.MoM, 'vs last month')}`) : kpi('Rep walk-in revenue (EGP)', fmtShort(RT.Rev), `${achPill(div(RT.Rev, RT.RT))} · ${deltaHtml(growth(RT.Rev, RT.LM), 'vs last month')}`)}
+      ${sel ? kpi('Visits', fmt(sel.V), achPill(sel.VA)) : kpi('Rep-referred visits', fmt(RT.V), achPill(div(RT.V, RT.VT)))}
+      ${kpi('Reps below 50% revenue target', R.filter(x => x.RA != null && x.RA < 0.5).length, `of ${R.length} reps`)}
+      ${dec.length ? kpi('Declining doctors', fmt(sum(dec, 'DoctorCount')), `${signed(sum(dec, 'VisitChange'))} visits vs last year`) : ''}
+      ${inc.length ? kpi('Growing doctors', fmt(sum(inc, 'DoctorCount')), `${signed(sum(inc, 'VisitChange'))} visits vs last year`) : ''}
+    </div>`);
+    main.insertAdjacentHTML('beforeend', `<h3 class="section-title">Medical rep scorecard</h3><div class="grid cols-2">
+      ${card('c1', 'Revenue achievement by rep', 'Walk-in revenue ÷ MTD target. Status colour + value on hover.', chartBox('ch1', 'tall'))}
+      ${card('c2', 'Revenue gap to target by rep (EGP)', 'Largest shortfalls first: where the money is', chartBox('ch2', 'tall'))}
+    </div><div class="grid" style="margin-top:14px">${card('c3', 'Rep table', 'MoM compares with the month stored in Revenue_LM (August in the October deck).', '<div id="t1"></div>')}</div>`);
+    const ra = R.filter(x => x.RA != null).sort((a, b) => b.RA - a.RA);
+    chart('ch1', 'bar', ra.map(x => x.Rep), [{ label: 'Revenue achievement', data: ra.map(x => x.RA), backgroundColor: ra.map(x => (S.p.rep !== 'All' && x.Rep !== S.p.rep) ? css('--grid') : statusColor(x.RA)) }], { horizontal: true, pct: true });
+    const rg = R.slice().sort((a, b) => a.Gap - b.Gap).slice(0, 12);
+    chart('ch2', 'bar', rg.map(x => x.Rep), [{ label: 'Gap to target', data: rg.map(x => x.Gap), backgroundColor: rg.map(x => (S.p.rep !== 'All' && x.Rep !== S.p.rep) ? css('--grid') : (x.Gap < 0 ? css('--bad') : css('--good'))) }], { horizontal: true });
+    table($('#t1'), [
+      { k: 'Rep', label: 'Rep', cls: 'l' }, { k: 'VT', label: 'Visit target', f: x => fmt(x.VT) }, { k: 'V', label: 'Visits', f: x => fmt(x.V) }, { k: 'VA', label: 'Visit ach', f: x => achPill(x.VA) },
+      { k: 'RT', label: 'Revenue target', f: x => fmt(x.RT) }, { k: 'Rev', label: 'Revenue', f: x => fmt(x.Rev) }, { k: 'RA', label: 'Revenue ach', f: x => achPill(x.RA) },
+      { k: 'Gap', label: 'Gap', f: x => `<span class="delta ${x.Gap < 0 ? 'down' : 'up'}">${signed(x.Gap)}</span>` },
+      { k: 'YoY', label: 'YoY', f: x => signedPct(x.YoY) }, { k: 'MoM', label: 'MoM', f: x => signedPct(x.MoM) }
+    ], R.filter(fRep), { sort: 'Gap', dir: 1, name: 'reps', total: S.p.rep === 'All' ? { Rep: 'Total', VT: fmt(RT.VT), V: fmt(RT.V), VA: achPill(div(RT.V, RT.VT)), RT: fmt(RT.RT), Rev: fmt(RT.Rev), RA: achPill(div(RT.Rev, RT.RT)), Gap: signed(RT.Rev - RT.RT), YoY: signedPct(growth(RT.Rev, RT.LY)), MoM: signedPct(growth(RT.Rev, RT.LM)) } : null });
+
+    // Specialty
+    const SP = Array.from(groupBy(specs, x => x.Specialty_EN), ([k, v]) => ({ Spec: k, D: sum(v, 'Doctors'), V: sum(v, 'Visits'), Rev: sum(v, 'Revenue') }));
+    const ST = { D: sum(SP, 'D'), V: sum(SP, 'V'), Rev: sum(SP, 'Rev') };
+    SP.forEach(x => Object.assign(x, { Ds: div(x.D, ST.D), Vs: div(x.V, ST.V), Rs: div(x.Rev, ST.Rev), VpD: div(x.V, x.D), RpV: div(x.Rev, x.V) }));
+    SP.sort((a, b) => b.Rev - a.Rev);
+    main.insertAdjacentHTML('beforeend', `<h3 class="section-title">Referring specialties ${S.branch === 'All' ? '(all branches)' : '— ' + esc(S.branch)}</h3><div class="grid cols-2">
+      ${card('c4', 'Share of doctors vs visits vs revenue', 'A specialty whose revenue share is above its doctor share is high value; below means under-performing.', chartBox('ch3', 'tall'))}
+      ${card('c5', 'Specialty table', 'Doctors on the target list, referred walk-in visits and revenue', '<div id="t2"></div>')}
+    </div>`);
+    const sp10 = SP.filter(x => x.D > 1).slice(0, 10);
+    chart('ch3', 'bar', sp10.map(x => x.Spec), [
+      { label: 'Doctor share', data: sp10.map(x => x.Ds), backgroundColor: css('--target'), pct: true },
+      { label: 'Visit share', data: sp10.map(x => x.Vs), backgroundColor: css('--s1'), pct: true },
+      { label: 'Revenue share', data: sp10.map(x => x.Rs), backgroundColor: css('--s2'), pct: true }], { pct: true });
+    table($('#t2'), [
+      { k: 'Spec', label: 'Specialty', cls: 'l' }, { k: 'D', label: 'Doctors', f: x => fmt(x.D) }, { k: 'V', label: 'Visits', f: x => fmt(x.V) },
+      { k: 'Rev', label: 'Revenue', f: x => fmtShort(x.Rev) }, { k: 'VpD', label: 'Visits / dr', f: x => (x.VpD == null ? '–' : x.VpD.toFixed(2)) }, { k: 'RpV', label: 'Rev / visit', f: x => fmt(x.RpV) }
+    ], SP, { sort: 'Rev', name: 'specialties', search: false, total: { Spec: 'Total', D: fmt(ST.D), V: fmt(ST.V), Rev: fmtShort(ST.Rev), VpD: (ST.V / ST.D || 0).toFixed(2), RpV: fmt(div(ST.Rev, ST.V)) } });
+
+    // Movers
+    const lists = uniq(yoy.map(x => x.List));
+    if (!lists.includes(S.p.moverList)) S.p.moverList = lists[0];
+    const mv = yoy.filter(x => x.List === S.p.moverList && fRep(x) && fSpec(x)).map(x => Object.assign({}, x, { Diff: n(x.Visits) - n(x.Visits_LY) }));
+    main.insertAdjacentHTML('beforeend', `<h3 class="section-title">Top referring doctors: year-on-year movers</h3>
+      <div class="card"><div class="card-head"><div><h3>${esc(S.p.moverList || '')}</h3><p class="sub">Doctors with the largest change in referred visits vs the same month last year. Lost = no referrals this year.</p></div>${lists.length ? segCtl('moverList', 'List', lists) : ''}</div><div id="t3"></div></div>`);
+    table($('#t3'), [
+      { k: 'DoctorID', label: 'Doctor ID', cls: 'l' }, { k: 'Doctor', label: 'Doctor', cls: 'l', f: x => `<span dir="auto">${esc(x.Doctor)}</span>` },
+      { k: 'Rep', label: 'Rep', cls: 'l' }, { k: 'Specialty_EN', label: 'Specialty', cls: 'l' },
+      { k: 'Visits_LY', label: 'Last year', f: x => fmt(n(x.Visits_LY)) }, { k: 'Visits', label: 'This year', f: x => fmt(n(x.Visits)) },
+      { k: 'Diff', label: 'Change', f: x => `<span class="delta ${x.Diff < 0 ? 'down' : 'up'}">${signed(x.Diff)}</span>` },
+      { k: 'Lost', label: 'Status', v: x => (n(x.Visits) === 0 ? 'Lost' : n(x.Visits_LY) === 0 ? 'New' : ''), f: x => (n(x.Visits) === 0 ? '<span class="pill bad">✕ Lost</span>' : n(x.Visits_LY) === 0 ? '<span class="pill good">★ New</span>' : '') }
+    ], mv, { sort: 'Diff', dir: /declin/i.test(S.p.moverList) ? 1 : -1, name: 'doctor_movers' });
+
+    // Feedback
+    const fbF = fb.filter(x => fRep(x) && fSpec(x) && (S.p.reason === 'All' || x.Suggested_Reason === S.p.reason)).map(x => Object.assign({}, x, { Diff: n(x.Visits) - n(x.Visits_LY) }));
+    const reasonCounts = Array.from(groupBy(fb.filter(x => fRep(x) && fSpec(x)), x => x.Suggested_Reason || 'Not coded'), ([k, v]) => ({ k, c: v.length, lost: sum(v, x => n(x.Visits) - n(x.Visits_LY)) })).sort((a, b) => b.c - a.c);
+    main.insertAdjacentHTML('beforeend', `<h3 class="section-title">Rep feedback on declining doctors</h3><div class="grid">
+      ${card('c6', 'Feedback by reason', 'Number of doctors per suggested reason (keyword-based, review before reporting)', chartBox('ch4', 'short'))}
+      <div class="card"><div class="card-head"><div><h3>Feedback log</h3><p class="sub">Search covers doctor, rep and comment text (Arabic or English).</p></div>${selCtl('reason', 'Reason', ['All', ...reasons])}</div><div id="t4"></div></div>
+    </div>`);
+    chart('ch4', 'bar', reasonCounts.map(x => x.k.length > 34 ? x.k.slice(0, 32) + '…' : x.k), [{ label: 'Doctors', data: reasonCounts.map(x => x.c), backgroundColor: css('--s1') }], { horizontal: true });
+    table($('#t4'), [
+      { k: 'Doctor', label: 'Doctor', cls: 'l', f: x => `<span dir="auto">${esc(x.Doctor)}</span><br><small style="color:var(--text-3)">${esc(x.DoctorID)} · ${esc(x.Specialty_EN)}</small>` },
+      { k: 'Rep', label: 'Rep', cls: 'l' },
+      { k: 'Diff', label: 'Change', f: x => `${fmt(n(x.Visits_LY))} → ${fmt(n(x.Visits))}` },
+      { k: 'Suggested_Reason', label: 'Reason', cls: 'l wrap', f: x => esc(x.Suggested_Reason) },
+      { k: 'Comment_AR', label: 'Comment', cls: 'wrap', f: x => `<span dir="auto">${esc(x.Comment_AR)}</span>` }
+    ], fbF, { sort: 'Diff', dir: 1, name: 'doctor_feedback' });
+  }
+
+  /* ================= 6. CORPORATE ================= */
+  function renderCorporate(main) {
+    const m = S.p.corpMetric;
+    const cats = rows('Corp_Category', { branch: false, segment: false });
+    const custs = rows('Corp_Customers', { branch: false, segment: false });
+    const isWalk = (x) => /normal patient|walk-in/i.test(x.Category_EN || '') || /normal patient/i.test(x.Category_AR || '');
+    const catNames = uniq(custs.map(x => x.Category_EN)).sort();
+    main.insertAdjacentHTML('beforeend', head('Corporate analysis', 'Results by customer category and by top corporate customer (insurers, syndicates, ministries, banks and companies).',
+      segCtl('corpMetric', 'Metric', ['Visits', 'Studies', 'Revenue']) + `<div class="field"><label>Scope</label><label class="check"><input type="checkbox" data-pf="corpWalkin"> Include walk-in (Normal Patient)</label></div>`));
+    if (S.branch !== 'All' || S.segment === 'Walk-in') main.insertAdjacentHTML('beforeend', '<div class="notice">Corporate data is network-wide; branch and segment filters do not apply here.</div>');
+    const C = Array.from(groupBy(cats.filter(x => S.p.corpWalkin || !isWalk(x)), x => x.Category_EN), ([k, v]) => ({ Cat: k, AR: v[0].Category_AR, Cur: sum(v, m), LY: sum(v, m + '_LY'), T: m === 'Revenue' ? sum(v, 'RevenueTarget') : null }))
+      .map(x => Object.assign(x, { G: growth(x.Cur, x.LY), D: x.Cur - x.LY, A: div(x.Cur, x.T), Gap: x.T == null ? null : x.Cur - x.T })).filter(x => x.Cur || x.LY || x.T);
+    const T = { Cur: sum(C, 'Cur'), LY: sum(C, 'LY'), T: m === 'Revenue' ? sum(C, x => n(x.T)) : null };
+    C.forEach(x => x.Sh = div(x.Cur, T.Cur));
+    C.sort((a, b) => b.Cur - a.Cur);
+    const declining = C.filter(x => x.D < 0).sort((a, b) => a.D - b.D);
+    main.insertAdjacentHTML('beforeend', `<div class="grid kpis">
+      ${kpi(`${S.p.corpWalkin ? 'Total' : 'Corporate'} ${m.toLowerCase()}${unit(m)}`, fmtShort(T.Cur), (m === 'Revenue' ? achPill(div(T.Cur, T.T)) + ' · ' : '') + deltaHtml(growth(T.Cur, T.LY), 'vs LY'))}
+      ${kpi('Categories', C.length, `${C.filter(x => x.D > 0).length} growing · ${declining.length} declining`)}
+      ${C[0] ? kpi('Largest category', esc(C[0].Cat), pct(C[0].Sh) + ' share') : ''}
+      ${declining[0] ? kpi('Biggest decline', esc(declining[0].Cat), signed(declining[0].D) + ' vs LY') : ''}
+    </div>`);
+    main.insertAdjacentHTML('beforeend', `<div class="grid cols-2">
+      ${card('c1', `Top categories: ${m}`, m === 'Revenue' ? 'Actual vs target vs last year (EGP)' : 'This year vs last year', chartBox('ch1', 'tall'))}
+      ${card('c2', 'Change vs last year by category', 'Largest gains and losses', chartBox('ch2', 'tall'))}
+    </div><div class="grid" style="margin-top:14px">${card('c3', 'Category table', '', '<div id="t1"></div>')}</div>`);
+    const c10 = C.slice(0, 10);
+    chart('ch1', 'bar', c10.map(x => x.Cat), m === 'Revenue' ? [
+      { label: 'Target', data: c10.map(x => x.T), backgroundColor: css('--target') }, { label: 'Actual', data: c10.map(x => x.Cur), backgroundColor: css('--s1') }, { label: 'Last year', data: c10.map(x => x.LY), backgroundColor: css('--s2') }] : [
+      { label: 'This year', data: c10.map(x => x.Cur), backgroundColor: css('--s1') }, { label: 'Last year', data: c10.map(x => x.LY), backgroundColor: css('--s2') }], { horizontal: true });
+    const ch = C.slice().sort((a, b) => b.D - a.D); const mvC = [...ch.slice(0, 6), ...ch.slice(-6).filter(x => !ch.slice(0, 6).includes(x))];
+    chart('ch2', 'bar', mvC.map(x => x.Cat), [{ label: 'Change vs LY', data: mvC.map(x => x.D), backgroundColor: mvC.map(x => x.D < 0 ? css('--bad') : css('--good')) }], { horizontal: true });
+    const cols = [{ k: 'Cat', label: 'Category', cls: 'l', f: x => `${esc(x.Cat)}<br><small dir="auto" style="color:var(--text-3)">${esc(x.AR)}</small>` },
+      { k: 'LY', label: 'Last year', f: x => fmt(x.LY) }, { k: 'Cur', label: 'This year', f: x => fmt(x.Cur) }, { k: 'D', label: 'Change', f: x => `<span class="delta ${x.D < 0 ? 'down' : 'up'}">${signed(x.D)}</span>` },
+      { k: 'G', label: 'YoY', f: x => signedPct(x.G) }, { k: 'Sh', label: 'Share', f: x => pct(x.Sh, 1) }];
+    if (m === 'Revenue') cols.push({ k: 'T', label: 'Target', f: x => fmt(x.T) }, { k: 'A', label: 'Ach', f: x => achPill(x.A) }, { k: 'Gap', label: 'Gap', f: x => signed(x.Gap) });
+    const tot = { Cat: 'Total', LY: fmt(T.LY), Cur: fmt(T.Cur), D: signed(T.Cur - T.LY), G: signedPct(growth(T.Cur, T.LY)), Sh: '100%' };
+    if (m === 'Revenue') Object.assign(tot, { T: fmt(T.T), A: achPill(div(T.Cur, T.T)), Gap: signed(T.Cur - T.T) });
+    table($('#t1'), cols, C, { sort: 'Cur', name: 'corp_categories_' + m, total: tot });
+
+    // customers
+    const CU = custs.filter(x => S.p.corpCategory === 'All' || x.Category_EN === S.p.corpCategory);
+    const K = Array.from(groupBy(CU, x => x.Customer), ([k, v]) => ({ Cust: k, Cat: v[0].Category_EN, Cur: sum(v, m), LY: sum(v, m + '_LY'), T: m === 'Revenue' ? sum(v, 'RevenueTarget') : null }))
+      .map(x => Object.assign(x, { G: growth(x.Cur, x.LY), D: x.Cur - x.LY, A: div(x.Cur, x.T), Gap: x.T == null ? null : x.Cur - x.T })).sort((a, b) => b.Cur - a.Cur);
+    main.insertAdjacentHTML('beforeend', `<h3 class="section-title">Top corporate customers</h3><div class="grid cols-2">
+      ${card('c4', m === 'Revenue' ? 'Revenue achievement by customer' : `${m}: growth vs last year by customer`, m === 'Revenue' ? 'Actual ÷ target' : 'YoY change %', chartBox('ch3', 'tall'))}
+      <div class="card"><div class="card-head"><div><h3>Customer table</h3><p class="sub">Customers listed in the deck</p></div>${selCtl('corpCategory', 'Category', ['All', ...catNames])}</div><div id="t2"></div></div>
+    </div>`);
+    const kk = K.slice().sort((a, b) => (m === 'Revenue' ? n(b.A) - n(a.A) : n(b.G) - n(a.G)));
+    const short = (s) => { const lat = String(s).match(/[A-Za-z][A-Za-z .&-]{2,}/); const t = lat ? lat[0].trim() : String(s); return t.length > 28 ? t.slice(0, 27) + '…' : t; };
+    chart('ch3', 'bar', kk.map(x => short(x.Cust)), [{ label: m === 'Revenue' ? 'Achievement' : 'YoY', data: kk.map(x => (m === 'Revenue' ? x.A : x.G)), backgroundColor: kk.map(x => (m === 'Revenue' ? statusColor(x.A) : (n(x.G) < 0 ? css('--bad') : css('--good')))) }], { horizontal: true, pct: true });
+    const kc = [{ k: 'Cust', label: 'Customer', cls: 'l', f: x => `<span dir="auto">${esc(x.Cust)}</span><br><small style="color:var(--text-3)">${esc(x.Cat)}</small>` },
+      { k: 'LY', label: 'Last year', f: x => fmt(x.LY) }, { k: 'Cur', label: 'This year', f: x => fmt(x.Cur) }, { k: 'G', label: 'YoY', f: x => signedPct(x.G) }];
+    if (m === 'Revenue') kc.push({ k: 'A', label: 'Ach', f: x => achPill(x.A) }, { k: 'Gap', label: 'Gap', f: x => `<span class="delta ${x.Gap < 0 ? 'down' : 'up'}">${signed(x.Gap)}</span>` });
+    table($('#t2'), kc, K, { sort: 'Cur', name: 'corp_customers_' + m });
+  }
+
+  /* ---------- Boot ---------- */
+  S.page = (location.hash || '#overview').slice(1);
+  bindGlobal(); renderNav(); tryDefault();
+})();
