@@ -1376,13 +1376,49 @@ dialog.modal::backdrop { background: rgba(0,0,0,.35); }
     const adapter = await navigator.gpu.requestAdapter(); if (!adapter) throw new Error('NO_WEBGPU');
     const m = AI_MODELS[choice] || AI_MODELS.fast; return adapter.features.has('shader-f16') ? m.f16 : m.f32;
   }
-  async function aiEngine(choice, onProgress) {
+  // Storage for the downloaded model: browser Cache API by default; IndexedDB is the fallback
+  // that copes better with flaky / proxied networks. The choice is remembered per browser.
+  const aiUseIDB = () => { try { return localStorage.getItem('bgscan-ai-idb') === '1'; } catch (e) { return false; } };
+  const aiSetIDB = (on) => { try { localStorage.setItem('bgscan-ai-idb', on ? '1' : '0'); } catch (e) { } };
+  async function aiEngine(choice, onProgress, useIDB) {
     const id = await aiPickModel(choice);
     if (AI.engine && AI.loaded === id) return AI.engine;
     AI.webllm = AI.webllm || await import(WEBLLM_URL);
-    if (AI.engine) { await AI.engine.unload(); AI.engine = null; AI.loaded = null; }
-    AI.engine = await AI.webllm.CreateMLCEngine(id, { initProgressCallback: onProgress });
+    if (AI.engine) { try { await AI.engine.unload(); } catch (e) { } AI.engine = null; AI.loaded = null; }
+    const opts = { initProgressCallback: onProgress };
+    if (useIDB && AI.webllm.prebuiltAppConfig) opts.appConfig = { ...AI.webllm.prebuiltAppConfig, useIndexedDBCache: true };
+    AI.engine = await AI.webllm.CreateMLCEngine(id, opts);
     AI.loaded = id; return AI.engine;
+  }
+  // Load the model with automatic retries; downloaded parts are kept, so each try resumes.
+  async function aiEngineWithRetry(choice, onProgress, onRetry) {
+    const tries = 4; let last;
+    for (let k = 1; k <= tries; k++) {
+      try { return await aiEngine(choice, onProgress, aiUseIDB()); }
+      catch (e) {
+        last = e;
+        const m = String((e && e.message) || e);
+        if (m === 'NO_WEBGPU' || /abort|interrupt/i.test(m) || /quota|QuotaExceeded|space/i.test(m) || k === tries || !AI.busy) throw e;
+        if (k === 1 && !aiUseIDB()) aiSetIDB(true); // switch storage method after the first failure
+        onRetry(k + 1, tries, m);
+        await new Promise(r => setTimeout(r, 3000 * k));
+      }
+    }
+    throw last;
+  }
+  function aiErrorText(e) {
+    const m = String((e && e.message) || e);
+    if (m === 'NO_WEBGPU') return "This browser can't run the AI: WebGPU is not available. Use the latest Chrome or Edge on a PC with a GPU (and turn on hardware acceleration).";
+    if (/quota|QuotaExceeded|space/i.test(m)) return 'The browser has no room to store the model. Free some disk space, do not use an Incognito/InPrivate window, or choose the Tiny model.';
+    if (/fetch|network|Failed|ERR_|load|timeout|cache\.add|status/i.test(m)) return 'The model download was interrupted several times. This usually means the network blocks or cuts large downloads from huggingface.co (company firewall / VPN). Try another network (e.g. mobile hotspot) or the Tiny model. Parts already downloaded are kept, so pressing Analyze again continues from where it stopped.';
+    return 'AI error.';
+  }
+  async function aiClearModels() {
+    let n = 0;
+    try { for (const k of await caches.keys()) if (/webllm|mlc|tvmjs/i.test(k)) { await caches.delete(k); n++; } } catch (e) { }
+    try { if (indexedDB.databases) for (const d of await indexedDB.databases()) if (d.name && /webllm|mlc|tvmjs/i.test(d.name)) { indexedDB.deleteDatabase(d.name); n++; } } catch (e) { }
+    AI.engine = null; AI.loaded = null;
+    toast(n ? 'Downloaded AI model removed from this browser' : 'No downloaded AI model found');
   }
   function aiPaint() {
     const out = document.getElementById('aiOutput'); if (!out) return;
@@ -1414,7 +1450,8 @@ dialog.modal::backdrop { background: rgba(0,0,0,.35); }
     };
     const timer = setInterval(paintLoad, 1000); paintLoad();
     try {
-      const eng = await aiEngine(AI.model, (r) => { if (r.progress !== lastP || r.text !== lastText) lastChange = Date.now(); lastP = r.progress; lastText = r.text; paintLoad(); });
+      const eng = await aiEngineWithRetry(AI.model, (r) => { if (r.progress !== lastP || r.text !== lastText) lastChange = Date.now(); lastP = r.progress; lastText = r.text; paintLoad(); },
+        (k, n, why) => { lastText = `Connection dropped (${why.slice(0, 120)}). Retrying ${k}/${n}: already-downloaded parts are kept…`; lastChange = Date.now(); paintLoad(); });
       clearInterval(timer);
       AI.status = '<p class="muted">Analysing…</p>'; aiPaint(); AI.status = '';
       const stream = await eng.chat.completions.create({ stream: true, temperature: 0.2, max_tokens: 900, messages: [{ role: 'system', content: aiSystemPrompt(AI.lang) }, { role: 'user', content: prompt(facts) }] });
@@ -1424,8 +1461,10 @@ dialog.modal::backdrop { background: rgba(0,0,0,.35); }
       clearInterval(timer);
       if (!/abort|interrupt/i.test(String(e && e.message))) {
         AI.results[page].text = '';
-        const msg = e && e.message === 'NO_WEBGPU' ? "This browser can't run the AI: WebGPU is not available. Use the latest Chrome or Edge on a PC with a GPU (and turn on hardware acceleration)." : 'AI error: ' + (e && e.message || e);
-        AI.status = ''; aiSetBusy(false); const out = document.getElementById('aiOutput'); if (out) out.innerHTML = `<p class="ai-error">${esc(msg)}</p>`; return;
+        const raw = String((e && e.message) || e);
+        AI.status = ''; aiSetBusy(false); const out = document.getElementById('aiOutput');
+        if (out) out.innerHTML = `<p class="ai-error">${esc(aiErrorText(e))}</p>` + (raw !== 'NO_WEBGPU' ? `<p class="muted" style="font-size:12px">Technical detail: ${esc(raw.slice(0, 300))}</p>` : '');
+        return;
       }
     } finally { AI.status = ''; aiSetBusy(false); }
     aiPaint();
@@ -1445,6 +1484,7 @@ dialog.modal::backdrop { background: rgba(0,0,0,.35); }
             <span class="spacer"></span>
             <label class="ai-ppt-toggle" title="Adds each page's latest AI result as a slide after that page in the PowerPoint export"><input type="checkbox" id="aiInPpt"${AI.inPpt ? ' checked' : ''}> Include in PowerPoint</label>
             <button id="aiCopy" class="btn" type="button" hidden>Copy</button>
+            <button id="aiClear" class="linkbtn" type="button" title="Delete the downloaded model from this browser (use if downloads keep failing)">Clear downloaded model</button>
           </div>
           <div class="ai-ask"><input id="aiQuestion" type="text" dir="auto" placeholder="Ask about this page… e.g. Which branch should we focus on first and why?"><button id="aiAsk" class="btn" type="button">Ask</button></div>
           <div id="aiOutput" class="ai-output" dir="auto"></div>
@@ -1461,6 +1501,7 @@ dialog.modal::backdrop { background: rgba(0,0,0,.35); }
     const ask = () => { const q = g('aiQuestion').value.trim(); if (!q) return g('aiQuestion').focus(); aiRun((f) => `Answer this question using only the FACTS. Question: ${q}\n\nFACTS:\n${JSON.stringify(f)}`, 'AI answer — ' + q); };
     g('aiAsk').onclick = ask; g('aiQuestion').onkeydown = (e) => { if (e.key === 'Enter') ask(); e.stopPropagation(); };
     g('aiStop').onclick = () => { try { AI.engine && AI.engine.interruptGenerate(); } catch (e) { } if (AI.busy && !AI.loaded) location.reload(); };
+    g('aiClear').onclick = () => { if (AI.busy) return toast('Press Stop first'); if (confirm('Delete the downloaded AI model from this browser? It will be downloaded again next time.')) aiClearModels(); };
     g('aiCopy').onclick = async () => { try { await navigator.clipboard.writeText(AI.results[S.page].text); g('aiCopy').textContent = 'Copied ✓'; setTimeout(() => { const c = g('aiCopy'); if (c) c.textContent = 'Copy'; }, 1500); } catch (e) { } };
     aiSetBusy(AI.busy); aiPaint();
   }
