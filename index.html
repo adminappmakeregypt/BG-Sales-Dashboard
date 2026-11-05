@@ -1315,12 +1315,13 @@ dialog.modal::backdrop { background: rgba(0,0,0,.35); }
        interprets those facts and is told not to calculate or invent figures. */
   const WEBLLM_URL = 'https://esm.run/@mlc-ai/web-llm@0.2.87';
   const AI_MODELS = {
-    tiny: { label: 'Tiny — Qwen2.5 0.5B (~400 MB, quick test)', f16: 'Qwen2.5-0.5B-Instruct-q4f16_1-MLC', f32: 'Qwen2.5-0.5B-Instruct-q4f32_1-MLC' },
-    fast: { label: 'Fast — Qwen2.5 1.5B (~1 GB)', f16: 'Qwen2.5-1.5B-Instruct-q4f16_1-MLC', f32: 'Qwen2.5-1.5B-Instruct-q4f32_1-MLC' },
-    quality: { label: 'Better — Qwen2.5 3B (~2 GB)', f16: 'Qwen2.5-3B-Instruct-q4f16_1-MLC', f32: 'Qwen2.5-3B-Instruct-q4f32_1-MLC' }
+    tiny: { label: 'Tiny — Qwen2.5 0.5B (~400 MB, safest)', f16: 'Qwen2.5-0.5B-Instruct-q4f16_1-MLC', f32: 'Qwen2.5-0.5B-Instruct-q4f32_1-MLC' },
+    fast: { label: 'Fast — Qwen2.5 1.5B (~1 GB, needs a good GPU)', f16: 'Qwen2.5-1.5B-Instruct-q4f16_1-MLC', f32: 'Qwen2.5-1.5B-Instruct-q4f32_1-MLC' },
+    quality: { label: 'Better — Qwen2.5 3B (~2 GB, strong GPU only)', f16: 'Qwen2.5-3B-Instruct-q4f16_1-MLC', f32: 'Qwen2.5-3B-Instruct-q4f32_1-MLC' }
   };
   const AI_LANGS = { en: 'English', ar: 'Arabic', fr: 'French' };
-  const AI = { webllm: null, engine: null, loaded: null, busy: false, open: false, model: 'fast', lang: 'en', inPpt: true, results: {}, facts: null, status: '' };
+  const AI_LOW_MEM = (navigator.deviceMemory || 8) < 8;
+  const AI = { webllm: null, engine: null, loaded: null, busy: false, open: false, model: (() => { try { return localStorage.getItem('bgscan-ai-model') || 'tiny'; } catch (e) { return 'tiny'; } })(), lang: 'en', inPpt: true, results: {}, facts: null, status: '' };
   const R0 = (v) => (v == null || !isFinite(v) ? null : Math.round(v));
   const P0 = (v) => (v == null || !isFinite(v) ? null : Math.round(v * 100));
   function setFacts(f) {
@@ -1431,11 +1432,22 @@ dialog.modal::backdrop { background: rgba(0,0,0,.35); }
   }
   function aiSetBusy(on) {
     AI.busy = on;
-    ['aiAnalyze', 'aiAsk'].forEach(id => { const b = document.getElementById(id); if (b) b.disabled = on; });
+    ['aiAnalyze', 'aiAsk', 'aiQuick'].forEach(id => { const b = document.getElementById(id); if (b) b.disabled = on; });
     const st = document.getElementById('aiStop'); if (st) st.hidden = !on;
+  }
+  // Big models can exhaust shared graphics memory and freeze the PC. Ask once before using them.
+  function aiHeavyOk() {
+    if (AI.model === 'tiny') return true;
+    let ok = false; try { ok = localStorage.getItem('bgscan-ai-heavy-ok') === AI.model; } catch (e) { }
+    if (ok) return true;
+    const warn = (AI_LOW_MEM ? `This PC reports less than 8 GB of memory. ` : '') + `The ${AI.model === 'fast' ? 'Fast (1.5B)' : 'Better (3B)'} model needs about ${AI.model === 'fast' ? '1.5–2' : '3'} GB of graphics memory. On laptops with built-in graphics it can make the whole PC unresponsive.\n\nClose other programs first. Use "Quick summary" or the Tiny model if unsure.\n\nContinue with this model?`;
+    if (!confirm(warn)) return false;
+    try { localStorage.setItem('bgscan-ai-heavy-ok', AI.model); } catch (e) { }
+    return true;
   }
   async function aiRun(prompt, title) {
     if (AI.busy || !AI.facts) return;
+    if (!aiHeavyOk()) return;
     const page = S.page, facts = AI.facts, sig = aiSig();
     AI.results[page] = { text: '', title, sig, at: '', model: '' };
     aiSetBusy(true);
@@ -1469,6 +1481,53 @@ dialog.modal::backdrop { background: rgba(0,0,0,.35); }
     } finally { AI.status = ''; aiSetBusy(false); }
     aiPaint();
   }
+  /* Quick summary: plain rules over the same facts. No download, no GPU, instant. English only. */
+  function aiQuickSummary(f) {
+    const L = [], pc = (v) => (v == null ? 'n/a' : v + '%'), nf = (v) => (v == null ? 'n/a' : fmt(v)), byGap = (a) => a.filter(x => x.gapToTarget != null).sort((x, y) => x.gapToTarget - y.gapToTarget);
+    const head = (t) => L.push('## ' + t), li = (t) => L.push('- ' + t);
+    const pg = S.page;
+    if (pg === 'overview') {
+      head('Overall picture');
+      (f.totals || []).forEach(t => li(`${t.metric}: ${nf(t.actual)} vs target ${nf(t.target)} (${pc(t.achievementPct)} achieved), ${t.vsLastYearPct == null ? 'no last-year base' : (t.vsLastYearPct >= 0 ? '+' : '') + t.vsLastYearPct + '% vs last year'}.`));
+      (f.bySegment || []).forEach(t => li(`${t.segment} ${t.metric.toLowerCase()}: ${pc(t.achievementPct)} of target.`));
+      const g = byGap(f.branches || []);
+      head('Main gaps'); g.filter(x => x.gapToTarget < 0).slice(0, 4).forEach(x => li(`${x.branch}: ${pc(x.achievementPct)} of target, gap ${nf(x.gapToTarget)}.`));
+      head('Bright spots'); (f.branches || []).filter(x => x.achievementPct != null).sort((a, b) => b.achievementPct - a.achievementPct).slice(0, 2).forEach(x => li(`${x.branch}: ${pc(x.achievementPct)} of target, ${x.vsLastYearPct == null ? 'new' : (x.vsLastYearPct >= 0 ? '+' : '') + x.vsLastYearPct + '% vs LY'}.`));
+      head('Suggested focus'); g.slice(0, 2).forEach(x => li(`Branch manager, ${x.branch}: recovery plan for the ${nf(x.gapToTarget)} gap.`));
+    } else if (pg === 'modality') {
+      const t = f.totals || {}, g = byGap(f.modalities || []);
+      head('Overall picture'); li(`${f.metricShown}: ${pc(t.achievementPct)} of target, gap ${nf(t.gapToTarget)}${t.vsLastYearPct != null ? `, ${t.vsLastYearPct >= 0 ? '+' : ''}${t.vsLastYearPct}% vs last year` : ''}${t.vsLastMonthPct != null ? `, ${t.vsLastMonthPct >= 0 ? '+' : ''}${t.vsLastMonthPct}% vs last month` : ''}.`);
+      head('Main gaps'); g.filter(x => x.gapToTarget < 0).slice(0, 4).forEach(x => li(`${x.modality}: ${pc(x.achievementPct)} of target, gap ${nf(x.gapToTarget)}${x.vsLastMonthPct != null && x.vsLastMonthPct < 0 ? `, down ${-x.vsLastMonthPct}% vs last month` : ''}.`));
+      head('Bright spots'); (f.modalities || []).filter(x => x.achievementPct >= 100).slice(0, 3).forEach(x => li(`${x.modality}: ${pc(x.achievementPct)} of target.`));
+    } else if (pg === 'utilization') {
+      const o = f.overall || {}; head('Overall picture'); li(`Machines used ${pc(o.utilizationPct)} of capacity; spare capacity ${nf(o.spareCapacity)} exams.`);
+      head('Capacity constrained (≥90%)'); (f.capacityConstrained || []).forEach(x => li(`${x.branch} ${x.modality}: ${pc(x.utilizationPct)}.`)); if (!(f.capacityConstrained || []).length) li('None.');
+      head('Most idle modalities'); (f.byModality || []).slice().sort((a, b) => a.utilizationPct - b.utilizationPct).slice(0, 3).forEach(x => li(`${x.modality}: ${pc(x.utilizationPct)} used, ${nf(x.spareCapacity)} spare exams.`));
+      head('Suggested focus'); li('The shortfall is mainly demand where utilization is low: push referrals and contracts for the idle modalities; plan extra hours only where ≥90%.');
+    } else if (pg === 'branch') {
+      head('Overall picture'); li(`Branches: ${f.branchesSelected}.`); (f.totals || []).forEach(t => li(`${t.metric}: ${pc(t.achievementPct)} of target (${nf(t.actual)} vs ${nf(t.target)}).`)); (f.bySegment || []).forEach(t => li(`${t.segment}: ${pc(t.achievementPct)} of ${t.metric.toLowerCase()} target.`));
+      head('Main gaps'); byGap(f.modalities || []).filter(x => x.gapToTarget < 0).slice(0, 4).forEach(x => li(`${x.modality}: revenue ${pc(x.revenueAchPct)} of target, gap ${nf(x.gapToTarget)}.`));
+      head('Bright spots'); (f.modalities || []).filter(x => x.revenueAchPct >= 100).slice(0, 3).forEach(x => li(`${x.modality}: revenue ${pc(x.revenueAchPct)} of target.`));
+    } else if (pg === 'doctors') {
+      const t = f.repTotals || {}; head('Overall picture'); li(`Rep walk-in revenue ${nf(t.revenue)} = ${pc(t.revenueAchPct)} of target; ${t.vsLastMonthPct == null ? '' : (t.vsLastMonthPct >= 0 ? '+' : '') + t.vsLastMonthPct + '% vs last month'}.`);
+      const dm = f.doctorMovement || {}; if (dm.decliningDoctors != null) li(`${dm.decliningDoctors} doctors declined (${nf(dm.visitsLostByDecliners)} visits); ${dm.growingDoctors} grew (+${nf(dm.visitsGainedByGrowers)}).`);
+      head('Largest rep gaps'); (f.reps || []).slice(0, 4).forEach(x => li(`${x.rep}: ${pc(x.revenueAchPct)} of target, gap ${nf(x.revenueGap)}${x.vsLastMonthPct != null && x.vsLastMonthPct < 0 ? `, ${x.vsLastMonthPct}% vs last month` : ''}.`));
+      head('Best performers'); (f.reps || []).slice().sort((a, b) => (b.revenueAchPct || 0) - (a.revenueAchPct || 0)).slice(0, 3).forEach(x => li(`${x.rep}: ${pc(x.revenueAchPct)} of target.`));
+      head('Top feedback reasons'); (f.feedbackReasons || []).slice(0, 4).forEach(x => li(`${x.reason}: ${x.doctors} doctors.`));
+    } else if (pg === 'corporate') {
+      const t = f.totals || {}; head('Overall picture'); li(`${f.metricShown}: ${nf(t.thisYear)}, ${t.vsLastYearPct == null ? '' : (t.vsLastYearPct >= 0 ? '+' : '') + t.vsLastYearPct + '% vs last year'}${t.achievementPct != null ? `, ${pc(t.achievementPct)} of target` : ''}.`);
+      head('Largest categories'); (f.categories || []).slice(0, 3).forEach(x => li(`${x.category}: ${pc(x.sharePct)} share${x.achievementPct != null ? `, ${pc(x.achievementPct)} of target` : ''}.`));
+      head('Biggest declines'); (f.biggestDeclines || []).slice(0, 4).forEach(x => li(`${x.category}: ${nf(x.change)} vs last year.`));
+      if (f.metricShown === 'Revenue') { head('Customers below target'); (f.customers || []).filter(x => x.achievementPct != null && x.achievementPct < 85).slice(0, 4).forEach(x => li(`${x.customer}: ${pc(x.achievementPct)} of target, gap ${nf(x.gapToTarget)}.`)); }
+    }
+    L.push('', 'Rule-based summary from the dashboard figures (no AI model). Use "Analyze this page" for a written AI analysis.');
+    return L.join('\n');
+  }
+  function aiQuick() {
+    if (AI.busy || !AI.facts) return;
+    AI.results[S.page] = { text: aiQuickSummary(AI.facts), title: 'Quick summary', sig: aiSig(), at: new Date().toLocaleString(), model: 'Quick summary (rules, no AI model)', filters: scopeLabel() };
+    aiPaint();
+  }
   function mountAI(main) {
     const anchor = $('.page-head', main); if (!anchor) return;
     anchor.insertAdjacentHTML('afterend', `
@@ -1479,6 +1538,7 @@ dialog.modal::backdrop { background: rgba(0,0,0,.35); }
           <div class="ai-controls">
             <label>Model <select id="aiModel">${Object.entries(AI_MODELS).map(([k, m]) => `<option value="${k}"${k === AI.model ? ' selected' : ''}>${m.label}</option>`).join('')}</select></label>
             <label>Language <select id="aiLang">${Object.entries(AI_LANGS).map(([k, l]) => `<option value="${k}"${k === AI.lang ? ' selected' : ''}>${l}</option>`).join('')}</select></label>
+            <button id="aiQuick" class="btn" type="button" title="Instant summary from the figures. No download, no graphics card needed.">⚡ Quick summary</button>
             <button id="aiAnalyze" class="btn primary" type="button">Analyze this page</button>
             <button id="aiStop" class="btn" type="button" hidden>Stop</button>
             <span class="spacer"></span>
@@ -1494,10 +1554,11 @@ dialog.modal::backdrop { background: rgba(0,0,0,.35); }
     const g = (id) => document.getElementById(id);
     g('aiCard').addEventListener('toggle', (e) => { AI.open = e.target.open; });
     g('aiFacts').textContent = JSON.stringify(AI.facts, null, 2);
-    g('aiModel').onchange = (e) => { AI.model = e.target.value; };
+    g('aiModel').onchange = (e) => { AI.model = e.target.value; try { localStorage.setItem('bgscan-ai-model', AI.model); } catch (er) { } };
     g('aiLang').onchange = (e) => { AI.lang = e.target.value; };
     g('aiInPpt').onchange = (e) => { AI.inPpt = e.target.checked; };
     g('aiAnalyze').onclick = () => aiRun(aiAnalysisPrompt, 'AI analysis');
+    g('aiQuick').onclick = aiQuick;
     const ask = () => { const q = g('aiQuestion').value.trim(); if (!q) return g('aiQuestion').focus(); aiRun((f) => `Answer this question using only the FACTS. Question: ${q}\n\nFACTS:\n${JSON.stringify(f)}`, 'AI answer — ' + q); };
     g('aiAsk').onclick = ask; g('aiQuestion').onkeydown = (e) => { if (e.key === 'Enter') ask(); e.stopPropagation(); };
     g('aiStop').onclick = () => { try { AI.engine && AI.engine.interruptGenerate(); } catch (e) { } if (AI.busy && !AI.loaded) location.reload(); };
