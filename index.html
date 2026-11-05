@@ -259,6 +259,37 @@ body.exporting .ai-card { display: none; }
 @media print { .ai-card { display: none; } }
 @media (max-width: 640px) { .ai-ask { flex-direction: column; } }
 
+/* Cloud: sign-in, user chip, access manager */
+body.locked .filters, body.locked .nav, body.locked #pptBtn, body.locked #printBtn, body.locked #presentBtn, body.locked #uploadBtn { display: none !important; }
+.auth-card { max-width: 440px; margin: 48px auto; background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 28px; box-shadow: var(--shadow); }
+.auth-card h2 { margin: 0 0 6px; font-size: 22px; }
+.auth-card p { color: var(--text-2); }
+.auth-card .muted { color: var(--text-3); }
+.auth-logo { height: 44px; background: #fff; border-radius: 6px; padding: 3px 6px; margin-bottom: 14px; }
+.auth-google { width: 100%; justify-content: center; padding: 10px; font-weight: 600; }
+.auth-google .g { font-weight: 800; color: #4285f4; }
+.auth-or { display: flex; align-items: center; gap: 10px; color: var(--text-3); font-size: 12px; margin: 16px 0 10px; }
+.auth-or::before, .auth-or::after { content: ''; flex: 1; border-top: 1px solid var(--border); }
+#auForm { display: flex; flex-direction: column; gap: 8px; }
+#auForm input { border: 1px solid var(--border); background: var(--surface); border-radius: 8px; padding: 9px 11px; }
+.auth-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 6px; }
+.linkbtn { border: 0; background: none; color: var(--s1); cursor: pointer; padding: 4px; font-size: 13px; }
+.auth-msg { min-height: 18px; font-size: 13px; color: var(--text-2); }
+.auth-msg.bad { color: var(--bad); }
+.user-chip { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-2); flex-wrap: wrap; }
+.user-chip .who { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.user-chip .role { border-radius: 999px; padding: 1px 8px; font-weight: 600; background: var(--surface-2); }
+.user-chip .role.admin { background: var(--bad-bg); color: var(--brand); }
+.publish-bar { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
+.publish-bar .pb-actions { display: flex; gap: 8px; }
+dialog.modal { border: 1px solid var(--border); border-radius: 14px; background: var(--surface); color: var(--text); width: min(760px, calc(100vw - 32px)); max-height: 85vh; overflow: auto; padding: 18px 20px; box-shadow: 0 20px 60px rgba(0,0,0,.25); }
+dialog.modal::backdrop { background: rgba(0,0,0,.35); }
+.modal-head { display: flex; justify-content: space-between; align-items: center; }
+.modal-head h3 { margin: 0; }
+.md-add { display: flex; gap: 8px; flex-wrap: wrap; }
+.md-add input { flex: 1; min-width: 200px; border: 1px solid var(--border); background: var(--surface); border-radius: 8px; padding: 7px 10px; }
+.md-add select, dialog.modal td select { border: 1px solid var(--border); background: var(--surface); border-radius: 8px; padding: 5px 8px; }
+
 </style>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
@@ -428,7 +459,7 @@ body.exporting .ai-card { display: none; }
   const scopeLabel = () => [rangeLabel(), S.branch === 'All' ? 'All branches' : S.branch, S.segment === 'All' ? 'Walk-in + Corporate' : S.segment].join(' · ');
 
   /* ---------- Loading ---------- */
-  function parseWorkbook(buf, name) {
+  function readWorkbook(buf) {
     const wb = XLSX.read(buf, { type: 'array', cellDates: true });
     const data = {}; const warnings = [];
     Object.keys(SCHEMA).forEach(sh => {
@@ -441,15 +472,31 @@ body.exporting .ai-card { display: none; }
       list.forEach(r => { r._p = ym(r.Period); });
       data[sh] = list.filter(r => r._p);
     });
+    if (!Object.values(data).some(l => l.length)) throw new Error('No rows with a valid Period were found.');
+    return { data, warnings };
+  }
+  function applyData(data, label, warnings) {
     const periods = uniq(Object.values(data).flat().map(r => r._p)).sort();
-    if (!periods.length) throw new Error('No rows with a valid Period were found.');
-    S.data = data; S.fileName = name; S.periods = periods;
+    if (!periods.length) { S.data = null; return false; }
+    S.data = data; S.fileName = label; S.periods = periods;
     S.from = S.to = periods[periods.length - 1];
     S.branch = 'All'; S.segment = 'All';
     setupFilters();
-    $('#dataLabel').textContent = `${name} · ${periods.length} month(s): ${ymLabel(periods[0])} – ${ymLabel(periods[periods.length - 1])}`;
-    S.warnings = warnings;
+    $('#dataLabel').textContent = `${label} · ${periods.length} month(s): ${ymLabel(periods[0])} – ${ymLabel(periods[periods.length - 1])}`;
+    S.warnings = warnings || [];
     render();
+    return true;
+  }
+  function parseWorkbook(buf, name) {
+    const { data, warnings } = readWorkbook(buf);
+    if (CLOUD.on) {
+      if (CLOUD.role !== 'admin') { toast('Only admins can load a workbook'); return; }
+      CLOUD.pending = { data, name };
+      applyData(data, name + ' (not published)', warnings);
+      toast('Preview only. Click "Publish" to share it with all users.');
+      return;
+    }
+    applyData(data, name, warnings);
     toast('Data loaded: ' + name);
   }
   function loadFile(file) {
@@ -458,7 +505,7 @@ body.exporting .ai-card { display: none; }
     rd.readAsArrayBuffer(file);
   }
   async function tryDefault() {
-    if (location.protocol === 'file:') return;
+    if (location.protocol === 'file:' || CLOUD.on) return;
     try {
       const r = await fetch(DEFAULT_FILE, { cache: 'no-store' });
       if (!r.ok) return;
@@ -538,6 +585,10 @@ body.exporting .ai-card { display: none; }
     const page = PAGES.find(p => p.id === S.page);
     const main = $('#page');
     main.innerHTML = '';
+    if (CLOUD.pending) {
+      main.insertAdjacentHTML('beforeend', `<div class="notice publish-bar"><span><b>Preview:</b> ${esc(CLOUD.pending.name)} is visible only to you. Publish it to replace the stored months it contains for all users.</span><span class="pb-actions"><button class="btn primary small" id="pbPublish" type="button">⤴ Publish to all users</button><button class="btn small" id="pbDiscard" type="button">Discard</button></span></div>`);
+      $('#pbPublish', main).onclick = cloudPublish; $('#pbDiscard', main).onclick = () => { CLOUD.pending = null; cloudLoad(); };
+    }
     if (S.warnings && S.warnings.length) main.insertAdjacentHTML('beforeend', `<div class="notice"><b>Workbook check:</b> ${S.warnings.map(esc).join(' · ')}</div>`);
     page.render(main);
     mountAI(main);
@@ -1034,6 +1085,208 @@ body.exporting .ai-card { display: none; }
     table($('#t2'), kc, K, { sort: 'Cur', name: 'corp_customers_' + m });
   }
 
+  /* ---------- Cloud backend (Firebase Auth + Firestore) ----------
+     • Only signed-in, verified members can read data; only admins can publish.
+       The real protection is firestore.rules; this code only shows the right screens.
+     • Data model: members/{email} {role}; periods/{YYYY-MM} {meta};
+       periods/{YYYY-MM}/sheets/{Sheet__n} {sheet, chunk, rows[]}.
+     • Leave apiKey empty to run without the cloud (upload-only mode). */
+  const FIREBASE_CONFIG = {
+    apiKey: 'AIzaSyB4bdSoXnsvGOqX5mpkPoVd9PyxiegCraM',
+    authDomain: 'sales-dashboard-ff48d.firebaseapp.com',
+    projectId: 'sales-dashboard-ff48d',
+    storageBucket: 'sales-dashboard-ff48d.firebasestorage.app',
+    messagingSenderId: '554304958931',
+    appId: '1:554304958931:web:310ef4b7bb905639c5ff26'
+  };
+  const ADMIN_EMAILS = ['mostafa.hegab83@gmail.com']; // first admin(s); keep the same list in firestore.rules
+  const FB_VER = '10.12.2';
+  const CLOUD = { on: !!FIREBASE_CONFIG.apiKey, fb: null, user: null, role: null, pending: null, meta: [] };
+  const lowerEmail = (u) => String((u && u.email) || '').toLowerCase();
+
+  function gate(html) {
+    document.body.classList.add('locked');
+    S.data = null; $('#dataLabel').textContent = CLOUD.user ? lowerEmail(CLOUD.user) : 'Sign in required';
+    $('#page').innerHTML = `<section class="auth-card">${html}</section>`;
+    cloudChip();
+  }
+  function authError(e) {
+    const c = (e && e.code) || '';
+    const m = { 'auth/invalid-credential': 'Wrong email or password.', 'auth/wrong-password': 'Wrong email or password.', 'auth/user-not-found': 'No account with this email. Use "Create account".',
+      'auth/email-already-in-use': 'An account with this email already exists. Sign in instead.', 'auth/weak-password': 'Password must be at least 6 characters.',
+      'auth/invalid-email': 'Enter a valid email address.', 'auth/popup-closed-by-user': 'Sign-in window was closed.', 'auth/unauthorized-domain': 'This site is not in Firebase Authentication → Settings → Authorized domains.',
+      'auth/operation-not-allowed': 'This sign-in method is not enabled in Firebase Authentication.', 'auth/too-many-requests': 'Too many attempts. Wait a few minutes and try again.', 'auth/network-request-failed': 'Network error. Check the connection.' };
+    return m[c] || (e && e.message) || String(e);
+  }
+  async function cloudInit() {
+    gate('<h2>Connecting…</h2><p class="muted">Loading secure sign-in.</p>');
+    try {
+      const base = `https://www.gstatic.com/firebasejs/${FB_VER}/`;
+      const [appM, A, F] = await Promise.all([import(base + 'firebase-app.js'), import(base + 'firebase-auth.js'), import(base + 'firebase-firestore.js')]);
+      const app = appM.initializeApp(FIREBASE_CONFIG);
+      CLOUD.fb = { auth: A.getAuth(app), db: F.getFirestore(app), A, F };
+      A.onAuthStateChanged(CLOUD.fb.auth, cloudOnAuth);
+    } catch (e) {
+      gate(`<h2>Could not connect</h2><p class="ai-error">${esc(e.message || e)}</p><p class="muted">The network may be blocking gstatic.com or googleapis.com.</p><button class="btn" type="button" onclick="location.reload()">Retry</button>`);
+    }
+  }
+  function cloudSignIn(msg = '') {
+    gate(`<img class="auth-logo" src="${esc($('.brand-logo') ? $('.brand-logo').src : '')}" alt="IDH">
+      <h2>Sign in</h2><p class="muted">Alborg Scan Business Review is for approved users only.</p>
+      <button class="btn auth-google" id="auGoogle" type="button"><span class="g">G</span> Continue with Google</button>
+      <div class="auth-or"><span>or with email</span></div>
+      <form id="auForm" autocomplete="on">
+        <input type="email" id="auEmail" placeholder="Email" required autocomplete="username">
+        <input type="password" id="auPass" placeholder="Password" required minlength="6" autocomplete="current-password">
+        <div class="auth-row"><button class="btn primary" type="submit">Sign in</button><button class="btn" id="auCreate" type="button">Create account</button><button class="linkbtn" id="auReset" type="button">Forgot password?</button></div>
+      </form>
+      <p class="auth-msg" id="auMsg">${msg}</p>`);
+    const { auth, A } = CLOUD.fb, say = (t, bad) => { const m = $('#auMsg'); m.innerHTML = esc(t); m.classList.toggle('bad', !!bad); };
+    $('#auGoogle').onclick = async () => { try { await A.signInWithPopup(auth, new A.GoogleAuthProvider()); } catch (e) { say(authError(e), true); } };
+    $('#auForm').onsubmit = async (e) => { e.preventDefault(); say('Signing in…'); try { await A.signInWithEmailAndPassword(auth, $('#auEmail').value.trim(), $('#auPass').value); } catch (er) { say(authError(er), true); } };
+    $('#auCreate').onclick = async () => {
+      const em = $('#auEmail').value.trim(), pw = $('#auPass').value; if (!em || pw.length < 6) return say('Enter your email and a password of at least 6 characters.', true);
+      try { const c = await A.createUserWithEmailAndPassword(auth, em, pw); await A.sendEmailVerification(c.user); } catch (er) { say(authError(er), true); }
+    };
+    $('#auReset').onclick = async () => { const em = $('#auEmail').value.trim(); if (!em) return say('Type your email first, then click "Forgot password?".', true); try { await A.sendPasswordResetEmail(auth, em); say('Password reset email sent to ' + em + '.'); } catch (er) { say(authError(er), true); } };
+  }
+  async function cloudOnAuth(user) {
+    CLOUD.user = user; CLOUD.role = null; CLOUD.pending = null;
+    if (!user) return cloudSignIn();
+    const { A, F, db } = CLOUD.fb, email = lowerEmail(user);
+    if (!user.emailVerified) {
+      gate(`<h2>Verify your email</h2><p>We sent a verification link to <b>${esc(email)}</b>. Open it, then click Continue.</p>
+        <div class="auth-row"><button class="btn primary" id="auCont" type="button">Continue</button><button class="btn" id="auResend" type="button">Resend email</button><button class="btn" id="auOut" type="button">Sign out</button></div><p class="auth-msg" id="auMsg"></p>`);
+      $('#auCont').onclick = async () => { await user.reload(); if (user.emailVerified) { await user.getIdToken(true); cloudOnAuth(user); } else { $('#auMsg').textContent = 'Not verified yet. Check your inbox (and spam).'; } };
+      $('#auResend').onclick = async () => { try { await A.sendEmailVerification(user); $('#auMsg').textContent = 'Sent again.'; } catch (e) { $('#auMsg').textContent = authError(e); } };
+      $('#auOut').onclick = () => A.signOut(CLOUD.fb.auth);
+      return;
+    }
+    gate('<h2>Checking access…</h2>');
+    let role = null;
+    try { const d = await F.getDoc(F.doc(db, 'members', email)); if (d.exists()) role = d.data().role === 'admin' ? 'admin' : 'viewer'; } catch (e) { /* permission denied = not a member */ }
+    if (!role && ADMIN_EMAILS.includes(email)) role = 'admin';
+    if (!role) {
+      gate(`<h2>No access yet</h2><p>You are signed in as <b>${esc(email)}</b>, but this email is not on the access list.</p><p class="muted">Ask the dashboard admin to add it under <b>Manage access</b>, then reload this page.</p>
+        <div class="auth-row"><button class="btn" type="button" onclick="location.reload()">Reload</button><button class="btn" id="auOut" type="button">Sign out</button></div>`);
+      $('#auOut').onclick = () => A.signOut(CLOUD.fb.auth);
+      return;
+    }
+    CLOUD.role = role;
+    document.body.classList.remove('locked');
+    cloudChip();
+    cloudLoad();
+  }
+  function cloudChip() {
+    let el = $('#userChip');
+    if (!el) { $('.actions').insertAdjacentHTML('afterbegin', '<span id="userChip" class="user-chip hide-present"></span>'); el = $('#userChip'); }
+    const up = $('#uploadBtn');
+    if (!CLOUD.user || !CLOUD.role) { el.innerHTML = CLOUD.user ? `<span class="who">${esc(lowerEmail(CLOUD.user))}</span>` : ''; if (up) up.style.display = 'none'; return; }
+    el.innerHTML = `<span class="who" title="Signed in">${esc(lowerEmail(CLOUD.user))}</span><span class="role ${CLOUD.role}">${CLOUD.role === 'admin' ? 'Admin' : 'Viewer'}</span>`
+      + (CLOUD.role === 'admin' ? '<button class="btn small" id="accessBtn" type="button">👥 Manage access</button>' : '')
+      + '<button class="btn small" id="signOutBtn" type="button">Sign out</button>';
+    if (up) { up.style.display = CLOUD.role === 'admin' ? '' : 'none'; up.textContent = '⤒ Upload & preview'; }
+    $('#signOutBtn').onclick = () => CLOUD.fb.A.signOut(CLOUD.fb.auth);
+    const ab = $('#accessBtn'); if (ab) ab.onclick = cloudManage;
+  }
+  async function cloudLoad() {
+    const { F, db } = CLOUD.fb;
+    $('#page').innerHTML = '<section class="auth-card"><h2>Loading data…</h2></section>';
+    try {
+      const ps = await F.getDocs(F.collection(db, 'periods'));
+      const data = {}; Object.keys(SCHEMA).forEach(k => { data[k] = []; });
+      CLOUD.meta = [];
+      for (const pd of ps.docs) {
+        CLOUD.meta.push({ id: pd.id, ...pd.data() });
+        const sh = await F.getDocs(F.collection(db, 'periods', pd.id, 'sheets'));
+        sh.docs.map(d => d.data()).sort((a, b) => (a.chunk || 0) - (b.chunk || 0)).forEach(d => {
+          (data[d.sheet] = data[d.sheet] || []).push(...(d.rows || []).map(r => Object.assign(r, { _p: ym(r.Period) })));
+        });
+      }
+      CLOUD.meta.sort((a, b) => a.id.localeCompare(b.id));
+      const last = CLOUD.meta.reduce((m, x) => { const t = x.updatedAt && x.updatedAt.toDate ? x.updatedAt.toDate() : null; return t && (!m || t > m.t) ? { t, by: x.updatedBy } : m; }, null);
+      const label = 'Cloud data' + (last ? ` · updated ${last.t.toLocaleDateString()} by ${last.by}` : '');
+      if (!applyData(data, label, [])) {
+        $('#dataLabel').textContent = 'No data published yet';
+        $('#page').innerHTML = `<section class="empty-state"><h2>No data published yet</h2><p>${CLOUD.role === 'admin' ? 'Upload the monthly workbook, check the preview, then click <b>Publish to all users</b>.' : 'The admin has not published any data yet.'}</p>${CLOUD.role === 'admin' ? '<button class="btn primary" type="button" onclick="document.getElementById(\'fileInput\').click()">⤒ Upload & preview</button>' : ''}</section>`;
+      }
+    } catch (e) {
+      $('#page').innerHTML = `<section class="auth-card"><h2>Could not load data</h2><p class="ai-error">${esc(e.code === 'permission-denied' ? 'Permission denied. Check that firestore.rules are published and your email is on the access list.' : (e.message || e))}</p><button class="btn" type="button" onclick="location.reload()">Retry</button></section>`;
+    }
+  }
+  // Firestore-safe copy of a row: dates as text, no helper or formula columns.
+  function cleanRow(r) {
+    const o = {};
+    Object.entries(r).forEach(([k, v]) => {
+      if (k === '_p' || !/^[A-Za-z0-9_ ]+$/.test(k) || v == null || v === '') return;
+      o[k] = v instanceof Date ? ym(v) + '-01' : (typeof v === 'number' && !isFinite(v) ? null : v);
+    });
+    if (r._p) o.Period = r._p + '-01';
+    return o;
+  }
+  async function cloudPublish() {
+    const pend = CLOUD.pending; if (!pend) return;
+    const { F, db } = CLOUD.fb, email = lowerEmail(CLOUD.user);
+    const byPeriod = {};
+    Object.entries(pend.data).forEach(([sheet, list]) => list.forEach(r => { ((byPeriod[r._p] = byPeriod[r._p] || {})[sheet] = byPeriod[r._p][sheet] || []).push(cleanRow(r)); }));
+    const months = Object.keys(byPeriod).sort();
+    const existing = new Set(CLOUD.meta.map(m => m.id));
+    const over = months.filter(m => existing.has(m));
+    const btn = $('#pbPublish'); if (btn) { btn.disabled = true; btn.textContent = 'Publishing…'; }
+    try {
+      for (const m of months) {
+        const old = await F.getDocs(F.collection(db, 'periods', m, 'sheets'));
+        const batch = F.writeBatch(db);
+        const replace = new Set(Object.keys(byPeriod[m]));
+        old.docs.forEach(d => { if (replace.has(d.data().sheet)) batch.delete(d.ref); });
+        const keepSheets = old.docs.map(d => d.data().sheet).filter(x => !replace.has(x));
+        Object.entries(byPeriod[m]).forEach(([sheet, list]) => {
+          let chunk = [], size = 0, idx = 0;
+          const flush = () => { batch.set(F.doc(db, 'periods', m, 'sheets', `${sheet}__${idx}`), { sheet, chunk: idx, rows: chunk }); idx++; chunk = []; size = 0; };
+          list.forEach(r => { const z = JSON.stringify(r).length; if (size + z > 600000 && chunk.length) flush(); chunk.push(r); size += z; });
+          if (chunk.length) flush();
+        });
+        batch.set(F.doc(db, 'periods', m), { period: m, fileName: pend.name, sheets: uniq([...keepSheets, ...replace]).sort(), updatedBy: email, updatedAt: F.serverTimestamp() });
+        await batch.commit();
+      }
+      CLOUD.pending = null;
+      toast(`Published ${months.length} month(s)` + (over.length ? ` (replaced ${over.map(ymLabel).join(', ')})` : ''));
+      cloudLoad();
+    } catch (e) {
+      if (btn) { btn.disabled = false; btn.textContent = '⤴ Publish to all users'; }
+      alert('Publish failed: ' + (e.code === 'permission-denied' ? 'permission denied (only admins can publish; check firestore.rules).' : (e.message || e)));
+    }
+  }
+  async function cloudManage() {
+    const { F, db } = CLOUD.fb, me = lowerEmail(CLOUD.user);
+    let dlg = $('#accessDlg');
+    if (!dlg) { document.body.insertAdjacentHTML('beforeend', '<dialog id="accessDlg" class="modal"></dialog>'); dlg = $('#accessDlg'); }
+    const draw = async (msg = '') => {
+      let members = [];
+      try { members = (await F.getDocs(F.collection(db, 'members'))).docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => a.id.localeCompare(b.id)); } catch (e) { msg = 'Could not read members: ' + (e.message || e); }
+      dlg.innerHTML = `<div class="modal-head"><h3>Manage access</h3><button class="btn small" id="mdClose" type="button">✕ Close</button></div>
+        <p class="muted">Only emails on this list can sign in and see data. <b>Admins</b> can upload, publish and manage access; <b>viewers</b> can only view. Built-in admin: ${esc(ADMIN_EMAILS.join(', '))}.</p>
+        <form id="mdAdd" class="md-add"><input type="email" id="mdEmail" placeholder="name@company.com" required><select id="mdRole"><option value="viewer">Viewer</option><option value="admin">Admin</option></select><button class="btn primary" type="submit">Add</button></form>
+        <p class="auth-msg ${/could not|fail/i.test(msg) ? 'bad' : ''}">${esc(msg)}</p>
+        <div class="tbl-wrap"><table><thead><tr><th>Email</th><th class="l">Role</th><th class="l">Added</th><th></th></tr></thead><tbody>${members.map(m => `<tr><td>${esc(m.id)}</td><td class="l"><select data-role="${esc(m.id)}"><option value="viewer"${m.role !== 'admin' ? ' selected' : ''}>Viewer</option><option value="admin"${m.role === 'admin' ? ' selected' : ''}>Admin</option></select></td><td class="l">${esc(m.addedBy || '')}</td><td>${m.id === me ? '<span class="muted">you</span>' : `<button class="btn small" data-del="${esc(m.id)}" type="button">Remove</button>`}</td></tr>`).join('') || '<tr><td colspan="4" class="l">No members yet.</td></tr>'}</tbody></table></div>
+        <h3 style="margin-top:18px">Published months</h3>
+        <div class="tbl-wrap"><table><thead><tr><th>Month</th><th class="l">File</th><th class="l">Updated by</th><th></th></tr></thead><tbody>${CLOUD.meta.map(x => `<tr><td>${esc(ymLabel(x.id))}</td><td class="l">${esc(x.fileName || '')}</td><td class="l">${esc(x.updatedBy || '')}</td><td><button class="btn small" data-delm="${esc(x.id)}" type="button">Delete month</button></td></tr>`).join('') || '<tr><td colspan="4" class="l">Nothing published.</td></tr>'}</tbody></table></div>`;
+      $('#mdClose', dlg).onclick = () => dlg.close();
+      $('#mdAdd', dlg).onsubmit = async (e) => {
+        e.preventDefault(); const em = $('#mdEmail', dlg).value.trim().toLowerCase();
+        try { await F.setDoc(F.doc(db, 'members', em), { role: $('#mdRole', dlg).value, addedBy: me, addedAt: F.serverTimestamp() }); draw(`Added ${em}. They can now sign in with this email.`); } catch (er) { draw('Could not add: ' + (er.message || er)); }
+      };
+      $$('[data-role]', dlg).forEach(sel => sel.onchange = async () => { try { await F.setDoc(F.doc(db, 'members', sel.dataset.role), { role: sel.value }, { merge: true }); draw('Role updated.'); } catch (er) { draw('Could not update: ' + (er.message || er)); } });
+      $$('[data-del]', dlg).forEach(b => b.onclick = async () => { if (!confirm('Remove access for ' + b.dataset.del + '?')) return; try { await F.deleteDoc(F.doc(db, 'members', b.dataset.del)); draw('Removed.'); } catch (er) { draw('Could not remove: ' + (er.message || er)); } });
+      $$('[data-delm]', dlg).forEach(b => b.onclick = async () => {
+        const m = b.dataset.delm; if (!confirm(`Delete all published data for ${ymLabel(m)}? This cannot be undone.`)) return;
+        try { const sh = await F.getDocs(F.collection(db, 'periods', m, 'sheets')); const batch = F.writeBatch(db); sh.docs.forEach(d => batch.delete(d.ref)); batch.delete(F.doc(db, 'periods', m)); await batch.commit(); CLOUD.meta = CLOUD.meta.filter(x => x.id !== m); draw(`Deleted ${ymLabel(m)}.`); cloudLoad(); } catch (er) { draw('Could not delete: ' + (er.message || er)); }
+      });
+    };
+    if (!dlg.open) dlg.showModal();
+    dlg.innerHTML = '<p>Loading…</p>'; await draw();
+  }
+
   /* ---------- AI Analyst (in-browser LLM, same design as the Assurance tracker) ----------
      • Runs on the user's machine with WebLLM + WebGPU. Data never leaves the browser;
        only the model weights are downloaded once and cached.
@@ -1306,7 +1559,8 @@ body.exporting .ai-card { display: none; }
 
   /* ---------- Boot ---------- */
   S.page = (location.hash || '#overview').slice(1);
-  bindGlobal(); renderNav(); tryDefault();
+  bindGlobal(); renderNav();
+  if (CLOUD.on) cloudInit(); else tryDefault();
 })();
 
 </script>
