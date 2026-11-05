@@ -1,6 +1,7 @@
 rules_version = '2';
 // Alborg Scan Business Review — Firestore security rules
-// • Members (members/{email}) can read published data; admins can publish and manage access.
+// • PUBLIC VIEW: anyone with the link can read published data (periods/*).
+// • Only admins (built-in or members/{email} with role 'admin') can publish and manage access.
 // • Members may sign in without email verification (accounts are created by an admin in
 //   Firebase Authentication → Users). Built-in admins must have a verified email.
 // • Keep the built-in admin list in sync with ADMIN_EMAILS in js/app.js.
@@ -28,10 +29,10 @@ service cloud.firestore {
     }
 
     match /periods/{period} {
-      allow read: if isMember() || isAdmin();
+      allow read: if true;
       allow write: if isAdmin() && period.matches('^[0-9]{4}-[0-9]{2}$');
       match /sheets/{sheet} {
-        allow read: if isMember() || isAdmin();
+        allow read: if true;
         allow write: if isAdmin();
       }
     }

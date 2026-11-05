@@ -1136,7 +1136,7 @@ dialog.modal::backdrop { background: rgba(0,0,0,.35); }
   }
   function cloudSignIn(msg = '') {
     gate(`<img class="auth-logo" src="${esc($('.brand-logo') ? $('.brand-logo').src : '')}" alt="IDH">
-      <h2>Sign in</h2><p class="muted">Alborg Scan Business Review is for approved users only. Your account is created by the dashboard admin.</p>
+      <h2>Admin sign in</h2><p class="muted">Sign in to upload and publish data or manage access. Viewing the dashboard does not need a login.</p>
       <button class="btn auth-google" id="auGoogle" type="button"><span class="g">G</span> Continue with Google</button>
       <div class="auth-or"><span>or with email</span></div>
       <form id="auForm" autocomplete="on">
@@ -1144,15 +1144,17 @@ dialog.modal::backdrop { background: rgba(0,0,0,.35); }
         <input type="password" id="auPass" placeholder="Password" required minlength="6" autocomplete="current-password">
         <div class="auth-row"><button class="btn primary" type="submit">Sign in</button><button class="linkbtn" id="auReset" type="button">Forgot password?</button></div>
       </form>
-      <p class="auth-msg" id="auMsg">${msg}</p>`);
+      <p class="auth-msg" id="auMsg">${msg}</p>
+      <button class="linkbtn" id="auBack" type="button">← Back to the dashboard</button>`);
     const { auth, A } = CLOUD.fb, say = (t, bad) => { const m = $('#auMsg'); m.innerHTML = esc(t); m.classList.toggle('bad', !!bad); };
+    $('#auBack').onclick = () => cloudPublic();
     $('#auGoogle').onclick = async () => { try { await A.signInWithPopup(auth, new A.GoogleAuthProvider()); } catch (e) { say(authError(e), true); } };
     $('#auForm').onsubmit = async (e) => { e.preventDefault(); say('Signing in…'); try { await A.signInWithEmailAndPassword(auth, $('#auEmail').value.trim(), $('#auPass').value); } catch (er) { say(authError(er), true); } };
     $('#auReset').onclick = async () => { const em = $('#auEmail').value.trim(); if (!em) return say('Type your email first, then click "Forgot password?".', true); try { await A.sendPasswordResetEmail(auth, em); say('Password reset email sent to ' + em + '.'); } catch (er) { say(authError(er), true); } };
   }
   async function cloudOnAuth(user) {
     CLOUD.user = user; CLOUD.role = null; CLOUD.pending = null;
-    if (!user) return cloudSignIn();
+    if (!user) return cloudPublic();
     const { A, F, db } = CLOUD.fb, email = lowerEmail(user);
     if (!user.emailVerified && ADMIN_EMAILS.includes(email)) {
       gate(`<h2>Verify your email</h2><p>We sent a verification link to <b>${esc(email)}</b>. Open it, then click Continue.</p>
@@ -1166,13 +1168,15 @@ dialog.modal::backdrop { background: rgba(0,0,0,.35); }
     let role = null;
     try { const d = await F.getDoc(F.doc(db, 'members', email)); if (d.exists()) role = d.data().role === 'admin' ? 'admin' : 'viewer'; } catch (e) { /* permission denied = not a member */ }
     if (!role && ADMIN_EMAILS.includes(email)) role = 'admin';
-    if (!role) {
-      gate(`<h2>No access yet</h2><p>You are signed in as <b>${esc(email)}</b>, but this email is not on the access list.</p><p class="muted">Ask the dashboard admin to add it under <b>Manage access</b>, then reload this page.</p>
-        <div class="auth-row"><button class="btn" type="button" onclick="location.reload()">Reload</button><button class="btn" id="auOut" type="button">Sign out</button></div>`);
-      $('#auOut').onclick = () => A.signOut(CLOUD.fb.auth);
-      return;
-    }
+    if (role !== 'admin') { toast(`${email} has no admin rights. Showing the public view.`); return cloudPublic(); }
     CLOUD.role = role;
+    document.body.classList.remove('locked');
+    cloudChip();
+    cloudLoad();
+  }
+  // Public view: anyone with the link can see published data; sign-in is only for admins.
+  function cloudPublic() {
+    CLOUD.role = 'public';
     document.body.classList.remove('locked');
     cloudChip();
     cloudLoad();
@@ -1181,6 +1185,13 @@ dialog.modal::backdrop { background: rgba(0,0,0,.35); }
     let el = $('#userChip');
     if (!el) { $('.actions').insertAdjacentHTML('afterbegin', '<span id="userChip" class="user-chip hide-present"></span>'); el = $('#userChip'); }
     const up = $('#uploadBtn');
+    if (CLOUD.role === 'public') {
+      el.innerHTML = CLOUD.user ? `<span class="who">${esc(lowerEmail(CLOUD.user))}</span><button class="btn small" id="signOutBtn" type="button">Sign out</button>` : '<button class="btn small" id="signInBtn" type="button" title="Admins only: upload and publish data, manage access">🔐 Admin sign in</button>';
+      if (up) up.style.display = 'none';
+      const si = $('#signInBtn'); if (si) si.onclick = () => cloudSignIn();
+      const so = $('#signOutBtn'); if (so) so.onclick = () => CLOUD.fb.A.signOut(CLOUD.fb.auth);
+      return;
+    }
     if (!CLOUD.user || !CLOUD.role) { el.innerHTML = CLOUD.user ? `<span class="who">${esc(lowerEmail(CLOUD.user))}</span>` : ''; if (up) up.style.display = 'none'; return; }
     el.innerHTML = `<span class="who" title="Signed in">${esc(lowerEmail(CLOUD.user))}</span><span class="role ${CLOUD.role}">${CLOUD.role === 'admin' ? 'Admin' : 'Viewer'}</span>`
       + (CLOUD.role === 'admin' ? '<button class="btn small" id="accessBtn" type="button">👥 Manage access</button>' : '')
@@ -1210,10 +1221,10 @@ dialog.modal::backdrop { background: rgba(0,0,0,.35); }
       const label = 'Cloud data' + (last ? ` · updated ${last.t.toLocaleDateString()} by ${last.by}` : '');
       if (!applyData(data, label, [])) {
         $('#dataLabel').textContent = 'No data published yet';
-        $('#page').innerHTML = `<section class="empty-state"><h2>No data published yet</h2><p>${CLOUD.role === 'admin' ? 'Upload the monthly workbook, check the preview, then click <b>Publish to all users</b>.' : 'The admin has not published any data yet.'}</p>${CLOUD.role === 'admin' ? '<button class="btn primary" type="button" onclick="document.getElementById(\'fileInput\').click()">⤒ Upload & preview</button>' : ''}</section>`;
+        $('#page').innerHTML = `<section class="empty-state"><h2>No data published yet</h2><p>${CLOUD.role === 'admin' ? 'Upload the monthly workbook, check the preview, then click <b>Publish to all users</b>.' : 'No data has been published yet.'}</p>${CLOUD.role === 'admin' ? '<button class="btn primary" type="button" onclick="document.getElementById(\'fileInput\').click()">⤒ Upload & preview</button>' : ''}</section>`;
       }
     } catch (e) {
-      $('#page').innerHTML = `<section class="auth-card"><h2>Could not load data</h2><p class="ai-error">${esc(e.code === 'permission-denied' ? 'Permission denied. Check that firestore.rules are published and your email is on the access list.' : (e.message || e))}</p><button class="btn" type="button" onclick="location.reload()">Retry</button></section>`;
+      $('#page').innerHTML = `<section class="auth-card"><h2>Could not load data</h2><p class="ai-error">${esc(e.code === 'permission-denied' ? 'Permission denied. Publish the latest firestore.rules in Firebase (Firestore Database → Rules).' : (e.message || e))}</p><button class="btn" type="button" onclick="location.reload()">Retry</button></section>`;
     }
   }
   // Firestore-safe copy of a row: dates as text, no helper or formula columns.
