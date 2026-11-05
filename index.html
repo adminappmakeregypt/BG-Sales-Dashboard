@@ -290,6 +290,10 @@ dialog.modal::backdrop { background: rgba(0,0,0,.35); }
 .md-add input { flex: 1; min-width: 200px; border: 1px solid var(--border); background: var(--surface); border-radius: 8px; padding: 7px 10px; }
 .md-add select, dialog.modal td select { border: 1px solid var(--border); background: var(--surface); border-radius: 8px; padding: 5px 8px; }
 
+.pw-modal { width: min(440px, calc(100vw - 32px)); }
+.pw-form { display: flex; flex-direction: column; gap: 8px; }
+.pw-form input { border: 1px solid var(--border); background: var(--surface); border-radius: 8px; padding: 9px 11px; }
+
 </style>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
@@ -1132,29 +1136,25 @@ dialog.modal::backdrop { background: rgba(0,0,0,.35); }
   }
   function cloudSignIn(msg = '') {
     gate(`<img class="auth-logo" src="${esc($('.brand-logo') ? $('.brand-logo').src : '')}" alt="IDH">
-      <h2>Sign in</h2><p class="muted">Alborg Scan Business Review is for approved users only.</p>
+      <h2>Sign in</h2><p class="muted">Alborg Scan Business Review is for approved users only. Your account is created by the dashboard admin.</p>
       <button class="btn auth-google" id="auGoogle" type="button"><span class="g">G</span> Continue with Google</button>
       <div class="auth-or"><span>or with email</span></div>
       <form id="auForm" autocomplete="on">
         <input type="email" id="auEmail" placeholder="Email" required autocomplete="username">
         <input type="password" id="auPass" placeholder="Password" required minlength="6" autocomplete="current-password">
-        <div class="auth-row"><button class="btn primary" type="submit">Sign in</button><button class="btn" id="auCreate" type="button">Create account</button><button class="linkbtn" id="auReset" type="button">Forgot password?</button></div>
+        <div class="auth-row"><button class="btn primary" type="submit">Sign in</button><button class="linkbtn" id="auReset" type="button">Forgot password?</button></div>
       </form>
       <p class="auth-msg" id="auMsg">${msg}</p>`);
     const { auth, A } = CLOUD.fb, say = (t, bad) => { const m = $('#auMsg'); m.innerHTML = esc(t); m.classList.toggle('bad', !!bad); };
     $('#auGoogle').onclick = async () => { try { await A.signInWithPopup(auth, new A.GoogleAuthProvider()); } catch (e) { say(authError(e), true); } };
     $('#auForm').onsubmit = async (e) => { e.preventDefault(); say('Signing in…'); try { await A.signInWithEmailAndPassword(auth, $('#auEmail').value.trim(), $('#auPass').value); } catch (er) { say(authError(er), true); } };
-    $('#auCreate').onclick = async () => {
-      const em = $('#auEmail').value.trim(), pw = $('#auPass').value; if (!em || pw.length < 6) return say('Enter your email and a password of at least 6 characters.', true);
-      try { const c = await A.createUserWithEmailAndPassword(auth, em, pw); await A.sendEmailVerification(c.user); } catch (er) { say(authError(er), true); }
-    };
     $('#auReset').onclick = async () => { const em = $('#auEmail').value.trim(); if (!em) return say('Type your email first, then click "Forgot password?".', true); try { await A.sendPasswordResetEmail(auth, em); say('Password reset email sent to ' + em + '.'); } catch (er) { say(authError(er), true); } };
   }
   async function cloudOnAuth(user) {
     CLOUD.user = user; CLOUD.role = null; CLOUD.pending = null;
     if (!user) return cloudSignIn();
     const { A, F, db } = CLOUD.fb, email = lowerEmail(user);
-    if (!user.emailVerified) {
+    if (!user.emailVerified && ADMIN_EMAILS.includes(email)) {
       gate(`<h2>Verify your email</h2><p>We sent a verification link to <b>${esc(email)}</b>. Open it, then click Continue.</p>
         <div class="auth-row"><button class="btn primary" id="auCont" type="button">Continue</button><button class="btn" id="auResend" type="button">Resend email</button><button class="btn" id="auOut" type="button">Sign out</button></div><p class="auth-msg" id="auMsg"></p>`);
       $('#auCont').onclick = async () => { await user.reload(); if (user.emailVerified) { await user.getIdToken(true); cloudOnAuth(user); } else { $('#auMsg').textContent = 'Not verified yet. Check your inbox (and spam).'; } };
@@ -1184,10 +1184,12 @@ dialog.modal::backdrop { background: rgba(0,0,0,.35); }
     if (!CLOUD.user || !CLOUD.role) { el.innerHTML = CLOUD.user ? `<span class="who">${esc(lowerEmail(CLOUD.user))}</span>` : ''; if (up) up.style.display = 'none'; return; }
     el.innerHTML = `<span class="who" title="Signed in">${esc(lowerEmail(CLOUD.user))}</span><span class="role ${CLOUD.role}">${CLOUD.role === 'admin' ? 'Admin' : 'Viewer'}</span>`
       + (CLOUD.role === 'admin' ? '<button class="btn small" id="accessBtn" type="button">👥 Manage access</button>' : '')
+      + ((CLOUD.user.providerData || []).some(p => p.providerId === 'password') ? '<button class="btn small" id="pwBtn" type="button">🔑 Change password</button>' : '')
       + '<button class="btn small" id="signOutBtn" type="button">Sign out</button>';
     if (up) { up.style.display = CLOUD.role === 'admin' ? '' : 'none'; up.textContent = '⤒ Upload & preview'; }
     $('#signOutBtn').onclick = () => CLOUD.fb.A.signOut(CLOUD.fb.auth);
     const ab = $('#accessBtn'); if (ab) ab.onclick = cloudManage;
+    const pb = $('#pwBtn'); if (pb) pb.onclick = cloudChangePassword;
   }
   async function cloudLoad() {
     const { F, db } = CLOUD.fb;
@@ -1257,6 +1259,24 @@ dialog.modal::backdrop { background: rgba(0,0,0,.35); }
       alert('Publish failed: ' + (e.code === 'permission-denied' ? 'permission denied (only admins can publish; check firestore.rules).' : (e.message || e)));
     }
   }
+  function cloudChangePassword() {
+    let dlg = $('#pwDlg');
+    if (!dlg) { document.body.insertAdjacentHTML('beforeend', '<dialog id="pwDlg" class="modal pw-modal"></dialog>'); dlg = $('#pwDlg'); }
+    dlg.innerHTML = `<div class="modal-head"><h3>Change password</h3><button class="btn small" id="pwClose" type="button">✕ Close</button></div>
+      <p class="muted">Optional. You can keep using the password the admin gave you.</p>
+      <form id="pwForm" class="pw-form"><input type="password" id="pw1" placeholder="New password (at least 6 characters)" minlength="6" required autocomplete="new-password">
+      <input type="password" id="pw2" placeholder="Repeat new password" minlength="6" required autocomplete="new-password">
+      <button class="btn primary" type="submit">Save new password</button></form><p class="auth-msg" id="pwMsg"></p>`;
+    const say = (t, bad) => { const m = $('#pwMsg', dlg); m.textContent = t; m.classList.toggle('bad', !!bad); };
+    $('#pwClose', dlg).onclick = () => dlg.close();
+    $('#pwForm', dlg).onsubmit = async (e) => {
+      e.preventDefault(); const a = $('#pw1', dlg).value, b = $('#pw2', dlg).value;
+      if (a !== b) return say('The two passwords do not match.', true);
+      try { await CLOUD.fb.A.updatePassword(CLOUD.fb.auth.currentUser || CLOUD.user, a); say('Password changed. Use the new password next time you sign in.'); $('#pwForm', dlg).reset(); }
+      catch (er) { say(er && er.code === 'auth/requires-recent-login' ? 'For security, sign out and sign in again, then change the password.' : authError(er), true); }
+    };
+    dlg.showModal();
+  }
   async function cloudManage() {
     const { F, db } = CLOUD.fb, me = lowerEmail(CLOUD.user);
     let dlg = $('#accessDlg');
@@ -1266,6 +1286,7 @@ dialog.modal::backdrop { background: rgba(0,0,0,.35); }
       try { members = (await F.getDocs(F.collection(db, 'members'))).docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => a.id.localeCompare(b.id)); } catch (e) { msg = 'Could not read members: ' + (e.message || e); }
       dlg.innerHTML = `<div class="modal-head"><h3>Manage access</h3><button class="btn small" id="mdClose" type="button">✕ Close</button></div>
         <p class="muted">Only emails on this list can sign in and see data. <b>Admins</b> can upload, publish and manage access; <b>viewers</b> can only view. Built-in admin: ${esc(ADMIN_EMAILS.join(', '))}.</p>
+        <p class="muted">For an email and password login, also create the account in <b>Firebase → Authentication → Users → Add user</b> with a temporary password. Google accounts only need to be added here.</p>
         <form id="mdAdd" class="md-add"><input type="email" id="mdEmail" placeholder="name@company.com" required><select id="mdRole"><option value="viewer">Viewer</option><option value="admin">Admin</option></select><button class="btn primary" type="submit">Add</button></form>
         <p class="auth-msg ${/could not|fail/i.test(msg) ? 'bad' : ''}">${esc(msg)}</p>
         <div class="tbl-wrap"><table><thead><tr><th>Email</th><th class="l">Role</th><th class="l">Added</th><th></th></tr></thead><tbody>${members.map(m => `<tr><td>${esc(m.id)}</td><td class="l"><select data-role="${esc(m.id)}"><option value="viewer"${m.role !== 'admin' ? ' selected' : ''}>Viewer</option><option value="admin"${m.role === 'admin' ? ' selected' : ''}>Admin</option></select></td><td class="l">${esc(m.addedBy || '')}</td><td>${m.id === me ? '<span class="muted">you</span>' : `<button class="btn small" data-del="${esc(m.id)}" type="button">Remove</button>`}</td></tr>`).join('') || '<tr><td colspan="4" class="l">No members yet.</td></tr>'}</tbody></table></div>

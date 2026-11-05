@@ -1,21 +1,25 @@
 rules_version = '2';
 // Alborg Scan Business Review — Firestore security rules
-// • Only signed-in users with a VERIFIED email can be members.
 // • Members (members/{email}) can read published data; admins can publish and manage access.
+// • Members may sign in without email verification (accounts are created by an admin in
+//   Firebase Authentication → Users). Built-in admins must have a verified email.
 // • Keep the built-in admin list in sync with ADMIN_EMAILS in js/app.js.
 service cloud.firestore {
   match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null && request.auth.token.email is string;
+    }
     function verified() {
-      return request.auth != null && request.auth.token.email_verified == true;
+      return signedIn() && request.auth.token.email_verified == true;
     }
     function myEmail() { return request.auth.token.email.lower(); }
     function memberDoc() { return /databases/$(database)/documents/members/$(myEmail()); }
     function builtInAdmin() { return verified() && myEmail() in ['appmakeregypt@gmail.com', 'mostafa.hegab83@gmail.com']; }
-    function isMember() { return verified() && exists(memberDoc()); }
+    function isMember() { return signedIn() && exists(memberDoc()); }
     function isAdmin() { return builtInAdmin() || (isMember() && get(memberDoc()).data.role == 'admin'); }
 
     match /members/{email} {
-      allow get: if verified() && (email == myEmail() || isAdmin());
+      allow get: if signedIn() && (email == myEmail() || isAdmin());
       allow list: if isAdmin();
       allow create, update: if isAdmin()
         && email == email.lower()
