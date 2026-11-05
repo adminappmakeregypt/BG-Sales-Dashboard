@@ -1388,30 +1388,30 @@ dialog.modal::backdrop { background: rgba(0,0,0,.35); }
     const adapter = await navigator.gpu.requestAdapter(); if (!adapter) throw new Error('NO_WEBGPU');
     const m = AI_MODELS[choice] || AI_MODELS.fast; return adapter.features.has('shader-f16') ? m.f16 : m.f32;
   }
-  // Storage for the downloaded model: browser Cache API by default; IndexedDB is the fallback
-  // that copes better with flaky / proxied networks. The choice is remembered per browser.
-  const aiUseIDB = () => { try { return localStorage.getItem('bgscan-ai-idb') === '1'; } catch (e) { return false; } };
-  const aiSetIDB = (on) => { try { localStorage.setItem('bgscan-ai-idb', on ? '1' : '0'); } catch (e) { } };
-  async function aiEngine(choice, onProgress, useIDB) {
+  // Load the model the same way as the Assurance tracker (browser Cache API, no IndexedDB copy).
+  // One engine object is reused; if a load fails it is unloaded before any retry, so GPU and
+  // memory are released and never held twice.
+  try { localStorage.removeItem('bgscan-ai-idb'); } catch (e) { } // undo the earlier IndexedDB fallback
+  async function aiEngine(choice, onProgress) {
     const id = await aiPickModel(choice);
     if (AI.engine && AI.loaded === id) return AI.engine;
     AI.webllm = AI.webllm || await import(WEBLLM_URL);
-    if (AI.engine) { try { await AI.engine.unload(); } catch (e) { } AI.engine = null; AI.loaded = null; }
-    const opts = { initProgressCallback: onProgress };
-    if (useIDB && AI.webllm.prebuiltAppConfig) opts.appConfig = { ...AI.webllm.prebuiltAppConfig, useIndexedDBCache: true };
-    AI.engine = await AI.webllm.CreateMLCEngine(id, opts);
+    if (!AI.engine) AI.engine = new AI.webllm.MLCEngine({ initProgressCallback: onProgress });
+    else { try { await AI.engine.unload(); } catch (e) { } AI.loaded = null; AI.engine.setInitProgressCallback && AI.engine.setInitProgressCallback(onProgress); }
+    try { await AI.engine.reload(id); }
+    catch (e) { try { await AI.engine.unload(); } catch (er) { } AI.loaded = null; throw e; }
     AI.loaded = id; return AI.engine;
   }
-  // Load the model with automatic retries; downloaded parts are kept, so each try resumes.
+  // Retry only download/network failures (parts already downloaded stay in the cache).
   async function aiEngineWithRetry(choice, onProgress, onRetry) {
-    const tries = 4; let last;
+    const tries = 3; let last;
     for (let k = 1; k <= tries; k++) {
-      try { return await aiEngine(choice, onProgress, aiUseIDB()); }
+      try { return await aiEngine(choice, onProgress); }
       catch (e) {
         last = e;
         const m = String((e && e.message) || e);
-        if (m === 'NO_WEBGPU' || /abort|interrupt/i.test(m) || /quota|QuotaExceeded|space/i.test(m) || k === tries || !AI.busy) throw e;
-        if (k === 1 && !aiUseIDB()) aiSetIDB(true); // switch storage method after the first failure
+        const network = /fetch|network|ERR_|timeout|cache\.add|status|load failed/i.test(m);
+        if (!network || k === tries || !AI.busy) throw e;
         onRetry(k + 1, tries, m);
         await new Promise(r => setTimeout(r, 3000 * k));
       }
